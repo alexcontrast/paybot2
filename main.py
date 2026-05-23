@@ -1,0 +1,569 @@
+import os
+import re
+import html
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import requests
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL")
+BOT_API_SECRET = os.getenv("BOT_API_SECRET")
+POLL_SITE_REQUESTS_SECONDS = int(os.getenv("POLL_SITE_REQUESTS_SECONDS", "20"))
+
+(
+    BIND_NAME,
+    BIND_PIN,
+    CHOOSE_MONTH,
+    CHOOSE_EVENT,
+    CHOOSE_ITEM,
+    EXTRA_POSITION_NAME,
+    AMOUNT,
+    PAYMENT_METHOD,
+    CARD_NUMBER,
+    COMMENT,
+) = range(10)
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [["Новая заявка"], ["Мои заявки", "Привязать аккаунт"]],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+)
+
+PAYMENT_METHODS = ["По счету", "На карту", "Нал"]
+EXTRA_ITEM_ORDER = -1
+
+
+def require_env() -> None:
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not ADMIN_CHAT_ID:
+        missing.append("ADMIN_CHAT_ID")
+    if not APPS_SCRIPT_URL:
+        missing.append("APPS_SCRIPT_URL")
+    if not BOT_API_SECRET:
+        missing.append("BOT_API_SECRET")
+    if missing:
+        raise RuntimeError("Не заданы переменные окружения: " + ", ".join(missing))
+
+
+def api(action: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = {
+        "secret": BOT_API_SECRET,
+        "action": action,
+        "data": data or {},
+    }
+    response = requests.post(APPS_SCRIPT_URL, json=payload, timeout=35)
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError(result.get("error") or "Ошибка Apps Script API")
+    return result
+
+
+def money_number(raw: str) -> Optional[int]:
+    text = (raw or "").lower().strip()
+    text = text.replace("₸", "").replace("kzt", "").replace("тенге", "").replace("тг", "")
+    text = text.replace("\u00a0", " ").strip()
+    if re.fullmatch(r"\d+", text):
+        digits = text
+    elif re.fullmatch(r"\d{1,3}([ .,]\d{3})+", text):
+        digits = re.sub(r"[ .,]", "", text)
+    else:
+        return None
+    amount = int(digits)
+    return amount if amount > 0 else None
+
+
+def fmt_money(value: Any) -> str:
+    try:
+        n = int(round(float(value or 0)))
+    except Exception:
+        n = 0
+    return f"{n:,}".replace(",", " ") + " ₸"
+
+
+def esc(value: Any) -> str:
+    return html.escape(str(value or ""))
+
+
+def short(text: str, limit: int = 42) -> str:
+    value = str(text or "").strip()
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def month_keyboard(months: List[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(months), 2):
+        rows.append([InlineKeyboardButton(m, callback_data=f"month:{i + j}") for j, m in enumerate(months[i:i + 2])])
+    return InlineKeyboardMarkup(rows)
+
+
+def events_keyboard(events: List[Dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows = []
+    for idx, event in enumerate(events):
+        label = f"{event.get('eventDate', '')} · {short(event.get('customerName') or event.get('eventName'), 34)}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"event:{idx}")])
+    rows.append([InlineKeyboardButton("← Назад к месяцам", callback_data="back:months")])
+    return InlineKeyboardMarkup(rows)
+
+
+def items_keyboard(items: List[Dict[str, Any]], allow_extra: bool) -> InlineKeyboardMarkup:
+    rows = []
+    for item in items:
+        order = int(item.get("itemOrder") or 0)
+        paid = fmt_money(item.get("paidAmount", 0))
+        label = f"{short(item.get('positionName') or item.get('contractorName'), 32)} · оплачено {paid}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"item:{order}")])
+    if allow_extra:
+        rows.append([InlineKeyboardButton("+ Добавить позицию", callback_data=f"item:{EXTRA_ITEM_ORDER}")])
+    rows.append([InlineKeyboardButton("← Назад к мероприятиям", callback_data="back:events")])
+    return InlineKeyboardMarkup(rows)
+
+
+def payment_method_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(m, callback_data=f"paymethod:{m}")] for m in PAYMENT_METHODS])
+
+
+def admin_keyboard(payment_id: str, status: str) -> Optional[InlineKeyboardMarkup]:
+    if status == "Новая":
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Оплачено", callback_data=f"admin:paid:{payment_id}"),
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"admin:reject:{payment_id}"),
+            ]
+        ])
+    if status == "Оплачено":
+        return InlineKeyboardMarkup([[InlineKeyboardButton("💰 Деньги в кассе", callback_data=f"admin:cashin:{payment_id}")]])
+    return None
+
+
+def manager_keyboard(payment_id: str, status: str) -> Optional[InlineKeyboardMarkup]:
+    if status == "Новая":
+        return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить заявку", callback_data=f"manager:cancel:{payment_id}")]])
+    return None
+
+
+def payment_text(request: Dict[str, Any], title: str = "🧾 Заявка на оплату") -> str:
+    status = request.get("status") or "Новая"
+    money_status = "Деньги в кассе" if status == "Деньги в кассе" else ("Отменено" if status in ["Отменено", "Отклонено"] else "Ждем деньги")
+    card = request.get("cardNumber") or ""
+    card_line = f"\nКарта: <code>{esc(card)}</code>" if card else ""
+    extra_comment = request.get("managerComment") or ""
+    comment_line = f"\nКомментарий: {esc(extra_comment)}" if extra_comment else ""
+    return (
+        f"{esc(title)}\n\n"
+        f"№: <b>{esc(request.get('paymentId'))}</b>\n"
+        f"Менеджер: <b>{esc(request.get('managerName'))}</b>\n"
+        f"Заказчик: {esc(request.get('customerName'))}\n"
+        f"Мероприятие: {esc(request.get('eventName'))}\n"
+        f"Дата: {esc(request.get('eventDate'))}\n\n"
+        f"Позиция: <b>{esc(request.get('positionName'))}</b>\n"
+        f"Подрядчик: {esc(request.get('contractorName'))}\n"
+        f"Способ оплаты: {esc(request.get('requestPaymentType'))}{card_line}\n"
+        f"Сумма заявки: <b>{fmt_money(request.get('requestAmount'))}</b>{comment_line}\n\n"
+        f"Статус оплаты: <b>{'На оплату' if status == 'Новая' else esc(status)}</b>\n"
+        f"Статус денег: <b>{esc(money_status)}</b>"
+    )
+
+
+async def ensure_bound(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, Any]]:
+    telegram_id = update.effective_user.id
+    cached = context.user_data.get("bound_user")
+    if cached:
+        return cached
+    try:
+        result = api("me", {"telegramId": telegram_id})
+        user = result.get("user")
+        context.user_data["bound_user"] = user
+        return user
+    except Exception:
+        return None
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    user = await ensure_bound(update, context)
+    if user:
+        await update.message.reply_text(
+            f"Привет, {user.get('name')}! Можно создавать заявки.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+    await update.message.reply_text(
+        "Привет! Это тестовый бот заявок на оплату.\n\n"
+        "Сначала привяжем Telegram к аккаунту на сайте. Напиши имя менеджера как на сайте:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return BIND_NAME
+
+
+async def bind_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    context.user_data.clear()
+    await update.message.reply_text("Напиши имя менеджера как на сайте:", reply_markup=ReplyKeyboardRemove())
+    return BIND_NAME
+
+
+async def bind_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["bind_name"] = update.message.text.strip()
+    await update.message.reply_text("Теперь введи PIN от сайта:")
+    return BIND_PIN
+
+
+async def bind_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tg_user = update.effective_user
+    try:
+        result = api("bind_user", {
+            "telegramId": tg_user.id,
+            "username": tg_user.username or "",
+            "fullName": tg_user.full_name or "",
+            "name": context.user_data.get("bind_name"),
+            "pin": update.message.text.strip(),
+        })
+        context.user_data["bound_user"] = result.get("user")
+        await update.message.reply_text("Готово, аккаунт привязан. Можно создавать заявки.", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+    except Exception as err:
+        await update.message.reply_text(f"Не получилось привязать аккаунт: {err}\n\nПопробуй снова: /start")
+        return ConversationHandler.END
+
+
+async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return ConversationHandler.END
+    user = await ensure_bound(update, context)
+    if not user:
+        await update.message.reply_text("Сначала привяжи аккаунт: /start")
+        return ConversationHandler.END
+    try:
+        await update.message.reply_text("Загружаю месяцы…")
+        result = api("list_months", {"telegramId": update.effective_user.id})
+        months = result.get("months", [])
+        if not months:
+            await update.message.reply_text("У тебя пока нет мероприятий в базе.", reply_markup=MAIN_KEYBOARD)
+            return ConversationHandler.END
+        context.user_data["months"] = months
+        await update.message.reply_text("Выбери месяц мероприятия:", reply_markup=month_keyboard(months))
+        return CHOOSE_MONTH
+    except Exception as err:
+        await update.message.reply_text(f"Не удалось загрузить месяцы: {err}", reply_markup=MAIN_KEYBOARD)
+        return ConversationHandler.END
+
+
+async def choose_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "back:months":
+        return await new_request_from_query(query, context)
+    idx = int(query.data.replace("month:", ""))
+    months = context.user_data.get("months", [])
+    month = months[idx]
+    context.user_data["selected_month"] = month
+    result = api("list_events", {"telegramId": query.from_user.id, "monthName": month})
+    events = result.get("events", [])
+    context.user_data["events"] = events
+    if not events:
+        await query.edit_message_text("В этом месяце мероприятий нет.")
+        return ConversationHandler.END
+    await query.edit_message_text(f"Месяц: {month}\nВыбери мероприятие:", reply_markup=events_keyboard(events))
+    return CHOOSE_EVENT
+
+
+async def new_request_from_query(query, context: ContextTypes.DEFAULT_TYPE):
+    result = api("list_months", {"telegramId": query.from_user.id})
+    months = result.get("months", [])
+    context.user_data["months"] = months
+    await query.edit_message_text("Выбери месяц мероприятия:", reply_markup=month_keyboard(months))
+    return CHOOSE_MONTH
+
+
+async def choose_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "back:months":
+        return await new_request_from_query(query, context)
+    idx = int(query.data.replace("event:", ""))
+    event = context.user_data.get("events", [])[idx]
+    context.user_data["selected_event"] = event
+    result = api("list_items", {"telegramId": query.from_user.id, "eventId": event.get("eventId")})
+    context.user_data["items"] = result.get("overview", [])
+    context.user_data["allow_extra"] = bool(result.get("allowExtraPosition"))
+    await query.edit_message_text(
+        f"{event.get('customerName')} · {event.get('eventName')}\n"
+        f"Дата: {event.get('eventDate')}\n\nВыбери позицию для оплаты:",
+        reply_markup=items_keyboard(context.user_data["items"], context.user_data["allow_extra"]),
+    )
+    return CHOOSE_ITEM
+
+
+async def choose_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "back:events":
+        events = context.user_data.get("events", [])
+        await query.edit_message_text("Выбери мероприятие:", reply_markup=events_keyboard(events))
+        return CHOOSE_EVENT
+    order = int(query.data.replace("item:", ""))
+    context.user_data["item_order"] = order
+    if order == EXTRA_ITEM_ORDER:
+        await query.edit_message_text("Введи название новой позиции-допрасхода:")
+        return EXTRA_POSITION_NAME
+    item = next((x for x in context.user_data.get("items", []) if int(x.get("itemOrder") or 0) == order), None)
+    context.user_data["selected_item"] = item or {}
+    await query.edit_message_text(f"Позиция: {item.get('positionName') if item else order}\n\nВведи сумму заявки:")
+    return AMOUNT
+
+
+async def extra_position_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Название не должно быть пустым. Введи название новой позиции:")
+        return EXTRA_POSITION_NAME
+    context.user_data["new_position_name"] = name
+    await update.message.reply_text("Теперь введи сумму заявки:")
+    return AMOUNT
+
+
+async def get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    amount = money_number(update.message.text)
+    if not amount:
+        await update.message.reply_text("Сумма должна быть числом. Например: 250000 или 250 000")
+        return AMOUNT
+    context.user_data["amount"] = amount
+    await update.message.reply_text("Выбери способ оплаты:", reply_markup=payment_method_keyboard())
+    return PAYMENT_METHOD
+
+
+async def choose_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    method = query.data.replace("paymethod:", "")
+    context.user_data["payment_method"] = method
+    if method == "На карту":
+        await query.edit_message_text("Введи номер карты. Ровно 16 цифр, можно с пробелами:")
+        return CARD_NUMBER
+    await query.edit_message_text("Комментарий к заявке? Если комментария нет — напиши «-».")
+    return COMMENT
+
+
+async def get_card_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    digits = re.sub(r"\D", "", update.message.text or "")
+    if len(digits) != 16:
+        await update.message.reply_text("Номер карты должен содержать ровно 16 цифр. Попробуй ещё раз:")
+        return CARD_NUMBER
+    context.user_data["card_number"] = digits
+    await update.message.reply_text("Комментарий к заявке? Если комментария нет — напиши «-».")
+    return COMMENT
+
+
+async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    comment = (update.message.text or "").strip()
+    if comment == "-":
+        comment = ""
+    context.user_data["comment"] = comment
+    await update.message.reply_text("Отправляю заявку…")
+    try:
+        event = context.user_data.get("selected_event", {})
+        payload = {
+            "eventId": event.get("eventId"),
+            "itemOrder": context.user_data.get("item_order"),
+            "amount": context.user_data.get("amount"),
+            "paymentType": context.user_data.get("payment_method"),
+            "cardNumber": context.user_data.get("card_number", ""),
+            "comment": comment,
+            "newPositionName": context.user_data.get("new_position_name", ""),
+        }
+        result = api("create_request", {"telegramId": update.effective_user.id, "payload": payload})
+        request = result.get("request", {})
+        manager_msg = await update.message.reply_html(
+            payment_text(request, "🧾 Заявка создана"),
+            reply_markup=manager_keyboard(request.get("paymentId"), request.get("status")),
+        )
+        admin_msg = await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=payment_text(request, "🧾 Новая заявка на оплату"),
+            parse_mode="HTML",
+            reply_markup=admin_keyboard(request.get("paymentId"), request.get("status")),
+        )
+        try:
+            api("mark_notified", {
+                "paymentId": request.get("paymentId"),
+                "adminMessageId": admin_msg.message_id,
+                "managerMessageId": manager_msg.message_id,
+            })
+        except Exception:
+            pass
+        await update.message.reply_text("Готово. Заявка ушла админу и появилась на сайте.", reply_markup=MAIN_KEYBOARD)
+    except Exception as err:
+        await update.message.reply_text(f"Не удалось отправить заявку: {err}", reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+
+async def my_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    user = await ensure_bound(update, context)
+    if not user:
+        await update.message.reply_text("Сначала привяжи аккаунт: /start")
+        return
+    try:
+        result = api("list_my_requests", {"telegramId": update.effective_user.id})
+        requests_list = result.get("requests", [])[:10]
+        if not requests_list:
+            await update.message.reply_text("Заявок пока нет.", reply_markup=MAIN_KEYBOARD)
+            return
+        for req in requests_list:
+            await update.message.reply_html(payment_text(req), reply_markup=manager_keyboard(req.get("paymentId"), req.get("status")))
+    except Exception as err:
+        await update.message.reply_text(f"Не удалось загрузить заявки: {err}")
+
+
+async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_CHAT_ID:
+        await query.answer("Эта кнопка только для админа.", show_alert=True)
+        return
+    _, action, payment_id = query.data.split(":", 2)
+    status = {"paid": "Оплачено", "reject": "Отклонено", "cashin": "Деньги в кассе"}[action]
+    try:
+        result = api("admin_update", {"paymentId": payment_id, "status": status, "comment": "Telegram"})
+        request = result.get("request", {})
+        await query.edit_message_text(
+            payment_text(request, "🧾 Заявка обновлена"),
+            parse_mode="HTML",
+            reply_markup=admin_keyboard(payment_id, request.get("status")),
+        )
+        manager_tg = request.get("telegramId")
+        if manager_tg:
+            await context.bot.send_message(
+                chat_id=int(manager_tg),
+                text=payment_text(request, "🔔 Статус заявки обновлён"),
+                parse_mode="HTML",
+            )
+    except Exception as err:
+        await query.answer(str(err), show_alert=True)
+
+
+async def handle_manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    _, action, payment_id = query.data.split(":", 2)
+    if action != "cancel":
+        return
+    try:
+        await query.edit_message_text("Отменяю заявку…")
+        api("cancel_request", {"telegramId": query.from_user.id, "paymentId": payment_id})
+        await query.edit_message_text("Заявка отменена.")
+    except Exception as err:
+        await query.edit_message_text(f"Не удалось отменить заявку: {err}")
+
+
+async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        result = api("list_unnotified", {})
+        for request in result.get("requests", []):
+            payment_id = request.get("paymentId")
+            admin_msg = await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=payment_text(request, "🧾 Новая заявка с сайта"),
+                parse_mode="HTML",
+                reply_markup=admin_keyboard(payment_id, request.get("status")),
+            )
+            manager_msg_id = ""
+            manager_tg = request.get("telegramId")
+            if manager_tg:
+                try:
+                    manager_msg = await context.bot.send_message(
+                        chat_id=int(manager_tg),
+                        text=payment_text(request, "🧾 Заявка создана на сайте"),
+                        parse_mode="HTML",
+                        reply_markup=manager_keyboard(payment_id, request.get("status")),
+                    )
+                    manager_msg_id = manager_msg.message_id
+                except Exception:
+                    manager_msg_id = ""
+            try:
+                api("mark_notified", {
+                    "paymentId": payment_id,
+                    "adminMessageId": admin_msg.message_id,
+                    "managerMessageId": manager_msg_id,
+                })
+            except Exception:
+                pass
+    except Exception as err:
+        print(f"poll_site_requests error: {err}")
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text("Действие отменено.", reply_markup=MAIN_KEYBOARD)
+    return ConversationHandler.END
+
+
+def main():
+    require_env()
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    bind_conversation = ConversationHandler(
+        entry_points=[CommandHandler("start", start), MessageHandler(filters.Regex("^Привязать аккаунт$"), bind_start)],
+        states={
+            BIND_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_name)],
+            BIND_PIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_pin)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    request_conversation = ConversationHandler(
+        entry_points=[CommandHandler("new", new_request), MessageHandler(filters.Regex("^Новая заявка$"), new_request)],
+        states={
+            CHOOSE_MONTH: [CallbackQueryHandler(choose_month, pattern="^(month:|back:months)")],
+            CHOOSE_EVENT: [CallbackQueryHandler(choose_event, pattern="^(event:|back:months)")],
+            CHOOSE_ITEM: [CallbackQueryHandler(choose_item, pattern="^(item:|back:events)")],
+            EXTRA_POSITION_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, extra_position_name)],
+            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_amount)],
+            PAYMENT_METHOD: [CallbackQueryHandler(choose_payment_method, pattern="^paymethod:")],
+            CARD_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_card_number)],
+            COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_comment_and_submit)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
+    app.add_handler(bind_conversation)
+    app.add_handler(request_conversation)
+    app.add_handler(MessageHandler(filters.Regex("^Мои заявки$"), my_requests))
+    app.add_handler(CallbackQueryHandler(handle_admin_action, pattern="^admin:"))
+    app.add_handler(CallbackQueryHandler(handle_manager_action, pattern="^manager:"))
+    app.add_handler(CommandHandler("cancel", cancel))
+
+    if app.job_queue:
+        app.job_queue.run_repeating(poll_site_requests, interval=POLL_SITE_REQUESTS_SECONDS, first=10)
+    else:
+        print("JobQueue недоступен. Установи python-telegram-bot[job-queue], чтобы бот уведомлял о заявках с сайта.")
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
