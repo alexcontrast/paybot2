@@ -29,7 +29,7 @@ BOT_API_SECRET = os.getenv("BOT_API_SECRET")
 POLL_SITE_REQUESTS_SECONDS = int(os.getenv("POLL_SITE_REQUESTS_SECONDS", "20"))
 
 (
-    BIND_NAME,
+    BIND_PHONE,
     BIND_PIN,
     CHOOSE_MONTH,
     CHOOSE_EVENT,
@@ -71,12 +71,29 @@ def api(action: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         "action": action,
         "data": data or {},
     }
-    response = requests.post(APPS_SCRIPT_URL, json=payload, timeout=35)
+    response = requests.post(APPS_SCRIPT_URL, json=payload, timeout=90)
     response.raise_for_status()
     result = response.json()
     if not result.get("ok"):
         raise RuntimeError(result.get("error") or "Ошибка Apps Script API")
     return result
+
+
+async def safe_edit_text(message, text: str, reply_markup=None, parse_mode: Optional[str] = None) -> None:
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception:
+        pass
+
+
+async def show_processing_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    if update.callback_query and update.callback_query.message:
+        await update.callback_query.answer(text.replace("…", ""))
+        await safe_edit_text(update.callback_query.message, f"⏳ {text}")
+        return update.callback_query.message
+    if update.message:
+        return await update.message.reply_text(f"⏳ {text}")
+    return None
 
 
 def money_number(raw: str) -> Optional[int]:
@@ -211,40 +228,64 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "Привет! Это тестовый бот заявок на оплату.\n\n"
-        "Сначала привяжем Telegram к аккаунту на сайте. Напиши имя менеджера как на сайте:",
+        "Сначала привяжем Telegram к аккаунту на сайте. Введи телефон в формате +7 (___) ___-__-__:",
         reply_markup=ReplyKeyboardRemove(),
     )
-    return BIND_NAME
+    return BIND_PHONE
+
+
+def normalize_kz_phone_for_bot(raw: str) -> Optional[str]:
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    if len(digits) == 10:
+        digits = "7" + digits
+    if len(digits) != 11 or not digits.startswith("7"):
+        return None
+    return f"+7 ({digits[1:4]}) {digits[4:7]}-{digits[7:9]}-{digits[9:11]}"
 
 
 async def bind_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return
     context.user_data.clear()
-    await update.message.reply_text("Напиши имя менеджера как на сайте:", reply_markup=ReplyKeyboardRemove())
-    return BIND_NAME
+    await update.message.reply_text(
+        "Введи телефон как на сайте в формате +7 (___) ___-__-__:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return BIND_PHONE
 
 
-async def bind_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["bind_name"] = update.message.text.strip()
-    await update.message.reply_text("Теперь введи PIN от сайта:")
+async def bind_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    formatted_phone = normalize_kz_phone_for_bot(update.message.text.strip())
+    if not formatted_phone:
+        await update.message.reply_text(
+            "Телефон нужен в формате +7 (___) ___-__-__.\n"
+            "Например: +7 (701) 123-45-67"
+        )
+        return BIND_PHONE
+    context.user_data["bind_phone"] = formatted_phone
+    await update.message.reply_text(f"Телефон: {formatted_phone}\nТеперь введи PIN от сайта:")
     return BIND_PIN
 
 
 async def bind_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_user = update.effective_user
+    progress_msg = await update.message.reply_text("⏳ Проверяю аккаунт…")
     try:
         result = api("bind_user", {
             "telegramId": tg_user.id,
             "username": tg_user.username or "",
             "fullName": tg_user.full_name or "",
-            "name": context.user_data.get("bind_name"),
+            "phone": context.user_data.get("bind_phone"),
             "pin": update.message.text.strip(),
         })
         context.user_data["bound_user"] = result.get("user")
+        await safe_edit_text(progress_msg, "✅ Аккаунт привязан.")
         await update.message.reply_text("Готово, аккаунт привязан. Можно создавать заявки.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
     except Exception as err:
+        await safe_edit_text(progress_msg, "⚠️ Не получилось привязать аккаунт.")
         await update.message.reply_text(f"Не получилось привязать аккаунт: {err}\n\nПопробуй снова: /start")
         return ConversationHandler.END
 
@@ -257,31 +298,33 @@ async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Сначала привяжи аккаунт: /start")
         return ConversationHandler.END
     try:
-        await update.message.reply_text("Загружаю месяцы…")
-        result = api("list_months", {"telegramId": update.effective_user.id})
+        status_msg = await update.message.reply_text("⏳ Загружаю мероприятия…")
+        result = api("list_flow", {"telegramId": update.effective_user.id})
         months = result.get("months", [])
+        events_by_month = result.get("eventsByMonth", {})
         if not months:
-            await update.message.reply_text("У тебя пока нет мероприятий в базе.", reply_markup=MAIN_KEYBOARD)
+            await status_msg.edit_text("У тебя пока нет мероприятий в базе.")
+            await update.message.reply_text("Главное меню:", reply_markup=MAIN_KEYBOARD)
             return ConversationHandler.END
         context.user_data["months"] = months
-        await update.message.reply_text("Выбери месяц мероприятия:", reply_markup=month_keyboard(months))
+        context.user_data["events_by_month"] = events_by_month
+        await status_msg.edit_text("Выбери месяц мероприятия:", reply_markup=month_keyboard(months))
         return CHOOSE_MONTH
     except Exception as err:
-        await update.message.reply_text(f"Не удалось загрузить месяцы: {err}", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text(f"Не удалось загрузить мероприятия: {err}", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
 
 
 async def choose_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer("Открываю месяц…")
     if query.data == "back:months":
         return await new_request_from_query(query, context)
     idx = int(query.data.replace("month:", ""))
     months = context.user_data.get("months", [])
     month = months[idx]
     context.user_data["selected_month"] = month
-    result = api("list_events", {"telegramId": query.from_user.id, "monthName": month})
-    events = result.get("events", [])
+    events = (context.user_data.get("events_by_month") or {}).get(month, [])
     context.user_data["events"] = events
     if not events:
         await query.edit_message_text("В этом месяце мероприятий нет.")
@@ -291,22 +334,31 @@ async def choose_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def new_request_from_query(query, context: ContextTypes.DEFAULT_TYPE):
-    result = api("list_months", {"telegramId": query.from_user.id})
-    months = result.get("months", [])
-    context.user_data["months"] = months
+    months = context.user_data.get("months", [])
+    if not months:
+        await safe_edit_text(query.message, "⏳ Загружаю мероприятия…")
+        result = api("list_flow", {"telegramId": query.from_user.id})
+        months = result.get("months", [])
+        context.user_data["months"] = months
+        context.user_data["events_by_month"] = result.get("eventsByMonth", {})
     await query.edit_message_text("Выбери месяц мероприятия:", reply_markup=month_keyboard(months))
     return CHOOSE_MONTH
 
 
 async def choose_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer("Загружаю позиции…")
     if query.data == "back:months":
         return await new_request_from_query(query, context)
     idx = int(query.data.replace("event:", ""))
     event = context.user_data.get("events", [])[idx]
     context.user_data["selected_event"] = event
-    result = api("list_items", {"telegramId": query.from_user.id, "eventId": event.get("eventId")})
+    await safe_edit_text(
+        query.message,
+        f"{event.get('customerName')} · {event.get('eventName')}\n"
+        f"Дата: {event.get('eventDate')}\n\n⏳ Загружаю позиции…"
+    )
+    result = api("list_items_fast", {"telegramId": query.from_user.id, "eventId": event.get("eventId")})
     context.user_data["items"] = result.get("overview", [])
     context.user_data["allow_extra"] = bool(result.get("allowExtraPosition"))
     await query.edit_message_text(
@@ -319,7 +371,7 @@ async def choose_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def choose_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer("Открываю позицию…")
     if query.data == "back:events":
         events = context.user_data.get("events", [])
         await query.edit_message_text("Выбери мероприятие:", reply_markup=events_keyboard(events))
@@ -357,7 +409,7 @@ async def get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def choose_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer("Выбран способ оплаты")
     method = query.data.replace("paymethod:", "")
     context.user_data["payment_method"] = method
     if method == "На карту":
@@ -382,7 +434,7 @@ async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_T
     if comment == "-":
         comment = ""
     context.user_data["comment"] = comment
-    await update.message.reply_text("Отправляю заявку…")
+    progress_msg = await update.message.reply_text("⏳ Отправляю заявку…")
     try:
         event = context.user_data.get("selected_event", {})
         payload = {
@@ -394,7 +446,7 @@ async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_T
             "comment": comment,
             "newPositionName": context.user_data.get("new_position_name", ""),
         }
-        result = api("create_request", {"telegramId": update.effective_user.id, "payload": payload})
+        result = api("create_request_fast", {"telegramId": update.effective_user.id, "payload": payload})
         request = result.get("request", {})
         manager_msg = await update.message.reply_html(
             payment_text(request, "🧾 Заявка создана"),
@@ -414,8 +466,10 @@ async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_T
             })
         except Exception:
             pass
+        await safe_edit_text(progress_msg, "✅ Заявка записана.")
         await update.message.reply_text("Готово. Заявка ушла админу и появилась на сайте.", reply_markup=MAIN_KEYBOARD)
     except Exception as err:
+        await safe_edit_text(progress_msg, "⚠️ Не удалось отправить заявку.")
         await update.message.reply_text(f"Не удалось отправить заявку: {err}", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
@@ -427,26 +481,32 @@ async def my_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         await update.message.reply_text("Сначала привяжи аккаунт: /start")
         return
+    progress_msg = await update.message.reply_text("⏳ Загружаю заявки…")
     try:
         result = api("list_my_requests", {"telegramId": update.effective_user.id})
         requests_list = result.get("requests", [])[:10]
         if not requests_list:
-            await update.message.reply_text("Заявок пока нет.", reply_markup=MAIN_KEYBOARD)
+            await safe_edit_text(progress_msg, "Заявок пока нет.")
+            await update.message.reply_text("Главное меню:", reply_markup=MAIN_KEYBOARD)
             return
+        await safe_edit_text(progress_msg, f"Найдено заявок: {len(requests_list)}")
         for req in requests_list:
             await update.message.reply_html(payment_text(req), reply_markup=manager_keyboard(req.get("paymentId"), req.get("status")))
     except Exception as err:
+        await safe_edit_text(progress_msg, "⚠️ Не удалось загрузить заявки.")
         await update.message.reply_text(f"Не удалось загрузить заявки: {err}")
 
 
 async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer("Обновляю статус…")
     if query.from_user.id != ADMIN_CHAT_ID:
         await query.answer("Эта кнопка только для админа.", show_alert=True)
         return
     _, action, payment_id = query.data.split(":", 2)
     status = {"paid": "Оплачено", "reject": "Отклонено", "cashin": "Деньги в кассе"}[action]
+    old_text = query.message.text_html or query.message.text or ""
+    await safe_edit_text(query.message, old_text + "\n\n⏳ Обновляю статус…", parse_mode="HTML")
     try:
         result = api("admin_update", {"paymentId": payment_id, "status": status, "comment": "Telegram"})
         request = result.get("request", {})
@@ -463,17 +523,18 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
                 parse_mode="HTML",
             )
     except Exception as err:
+        await safe_edit_text(query.message, old_text + f"\n\n⚠️ Не удалось обновить статус: {esc(err)}", parse_mode="HTML")
         await query.answer(str(err), show_alert=True)
 
 
 async def handle_manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer("Отменяю заявку…")
     _, action, payment_id = query.data.split(":", 2)
     if action != "cancel":
         return
     try:
-        await query.edit_message_text("Отменяю заявку…")
+        await query.edit_message_text("⏳ Отменяю заявку…")
         api("cancel_request", {"telegramId": query.from_user.id, "paymentId": payment_id})
         await query.edit_message_text("Заявка отменена.")
     except Exception as err:
@@ -529,7 +590,7 @@ def main():
     bind_conversation = ConversationHandler(
         entry_points=[CommandHandler("start", start), MessageHandler(filters.Regex("^Привязать аккаунт$"), bind_start)],
         states={
-            BIND_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_name)],
+            BIND_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_phone)],
             BIND_PIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_pin)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
