@@ -435,8 +435,12 @@ def payment_method_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(m, callback_data=f"paymethod:{m}")] for m in PAYMENT_METHODS])
 
 
+def is_new_payment_status(status: Any) -> bool:
+    return str(status or "").strip() in ["Новая", "На оплату"]
+
+
 def admin_keyboard(payment_id: str, status: str) -> Optional[InlineKeyboardMarkup]:
-    if status == "Новая":
+    if is_new_payment_status(status):
         return InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Оплачено", callback_data=f"admin:paid:{payment_id}"),
@@ -449,7 +453,9 @@ def admin_keyboard(payment_id: str, status: str) -> Optional[InlineKeyboardMarku
 
 
 def manager_keyboard(payment_id: str, status: str) -> Optional[InlineKeyboardMarkup]:
-    if status == "Новая":
+    # Apps Script/site may return the initial payment status either as "Новая"
+    # or as the UI label "На оплату". Both are active and cancelable.
+    if is_new_payment_status(status):
         return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить заявку", callback_data=f"manager:cancel:{payment_id}")]])
     return None
 
@@ -853,7 +859,7 @@ async def publish_created_request_cards(update: Update, context: ContextTypes.DE
     )
 
     # Button appears only after the request is fully created and message IDs are saved.
-    keyboard = manager_keyboard(payment_id, request.get("status"))
+    keyboard = manager_keyboard(payment_id, request.get("status") or "Новая")
     if keyboard:
         try:
             await context.bot.edit_message_reply_markup(
@@ -863,6 +869,8 @@ async def publish_created_request_cards(update: Update, context: ContextTypes.DE
             )
         except Exception as err:
             print(f"manager cancel keyboard attach failed for {payment_id}: {err}")
+    else:
+        print(f"manager cancel keyboard not attached for {payment_id}: status={request.get('status')!r}")
 
 
 async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
