@@ -30,7 +30,7 @@ from telegram.ext import (
     filters,
 )
 
-# v157: cleanup final service text and robust admin-card deletion on manager cancel.
+# v160: delete admin card too when a request is canceled/archived from the website; preserve all known Telegram message IDs.
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL")
@@ -291,10 +291,28 @@ def remember_payment_messages(payment_id: Any, admin_message_id: Any = None, man
         return
     key = str(payment_id)
     item = PAYMENT_MESSAGE_CACHE.get(key, {})
+
+    # v160: keep not only the last message_id, but the full known history.
+    # If a request was accidentally sent twice earlier, cancellation/archiving must
+    # remove every known admin/manager card, not just the latest one.
     if admin_message_id:
         item["admin_message_id"] = admin_message_id
+        ids = item.setdefault("admin_message_ids", [])
+        try:
+            admin_int = int(admin_message_id)
+            if admin_int not in ids:
+                ids.append(admin_int)
+        except Exception:
+            pass
     if manager_message_id:
         item["manager_message_id"] = manager_message_id
+        ids = item.setdefault("manager_message_ids", [])
+        try:
+            manager_int = int(manager_message_id)
+            if manager_int not in ids:
+                ids.append(manager_int)
+        except Exception:
+            pass
     if manager_telegram_id:
         item["manager_telegram_id"] = manager_telegram_id
     item["updated_at"] = time.time()
@@ -312,25 +330,52 @@ async def remove_progress_message(context: ContextTypes.DEFAULT_TYPE, payment_id
         await safe_delete_message(context, item.get("chat_id"), item.get("message_id"))
 
 
+def unique_int_ids(*values) -> List[int]:
+    result: List[int] = []
+    for value in values:
+        if isinstance(value, (list, tuple, set)):
+            iterable = value
+        else:
+            iterable = [value]
+        for item in iterable:
+            try:
+                n = int(item)
+            except Exception:
+                continue
+            if n and n not in result:
+                result.append(n)
+    return result
+
+
 async def remove_payment_messages_by_id(context: ContextTypes.DEFAULT_TYPE, payment_id: Any, manager_telegram_id: Any = None) -> None:
     key = str(payment_id or "")
     item = PAYMENT_MESSAGE_CACHE.pop(key, {})
 
-    # v157: after Railway redeploys or slow create flows, the in-memory cache can be empty.
-    # Fetch message IDs from Apps Script so manager-cancel also removes the admin card.
+    # v157/v160: after Railway redeploys or slow create flows, the in-memory cache can be empty.
+    # Fetch message IDs from Apps Script so manager/site cancellation also removes the admin card.
     request = None
     try:
         request = await fetch_payment_request(payment_id, timeout=20)
     except Exception:
         request = None
 
-    admin_id = item.get("admin_message_id") or (request or {}).get("telegramAdminMessageId")
-    manager_msg_id = item.get("manager_message_id") or (request or {}).get("telegramManagerMessageId")
+    admin_ids = unique_int_ids(
+        item.get("admin_message_ids"),
+        item.get("admin_message_id"),
+        (request or {}).get("telegramAdminMessageId"),
+    )
+    manager_ids = unique_int_ids(
+        item.get("manager_message_ids"),
+        item.get("manager_message_id"),
+        (request or {}).get("telegramManagerMessageId"),
+    )
     manager_tg = manager_telegram_id or item.get("manager_telegram_id") or (request or {}).get("telegramId")
 
-    await safe_delete_message(context, ADMIN_CHAT_ID, admin_id)
-    if manager_tg and manager_msg_id:
-        await safe_delete_message(context, manager_tg, manager_msg_id)
+    for admin_id in admin_ids:
+        await safe_delete_message(context, ADMIN_CHAT_ID, admin_id)
+    if manager_tg:
+        for manager_msg_id in manager_ids:
+            await safe_delete_message(context, manager_tg, manager_msg_id)
     await remove_progress_message(context, payment_id)
 
 
@@ -343,12 +388,38 @@ async def remove_archived_payment_messages(
 ) -> None:
     payment_id = request.get("paymentId")
     cached = PAYMENT_MESSAGE_CACHE.pop(str(payment_id or ""), {})
-    admin_id = admin_message_id or request.get("telegramAdminMessageId") or cached.get("admin_message_id")
-    manager_msg_id = manager_message_id or request.get("telegramManagerMessageId") or cached.get("manager_message_id")
-    manager_tg = manager_telegram_id or request.get("telegramId") or cached.get("manager_telegram_id")
-    await safe_delete_message(context, ADMIN_CHAT_ID, admin_id)
-    if manager_tg and manager_msg_id:
-        await safe_delete_message(context, manager_tg, manager_msg_id)
+
+    # v160: for status changes made on the website, list_status_updates can return
+    # only part of Telegram metadata if old rows were created during a timeout.
+    # Pull the full request once more before deleting, then delete every known card.
+    full_request = None
+    try:
+        full_request = await fetch_payment_request(payment_id, timeout=20)
+    except Exception:
+        full_request = None
+    full_request = full_request or {}
+
+    admin_ids = unique_int_ids(
+        admin_message_id,
+        request.get("telegramAdminMessageId"),
+        full_request.get("telegramAdminMessageId"),
+        cached.get("admin_message_id"),
+        cached.get("admin_message_ids"),
+    )
+    manager_ids = unique_int_ids(
+        manager_message_id,
+        request.get("telegramManagerMessageId"),
+        full_request.get("telegramManagerMessageId"),
+        cached.get("manager_message_id"),
+        cached.get("manager_message_ids"),
+    )
+    manager_tg = manager_telegram_id or request.get("telegramId") or full_request.get("telegramId") or cached.get("manager_telegram_id")
+
+    for admin_id in admin_ids:
+        await safe_delete_message(context, ADMIN_CHAT_ID, admin_id)
+    if manager_tg:
+        for manager_msg_id in manager_ids:
+            await safe_delete_message(context, manager_tg, manager_msg_id)
     await remove_progress_message(context, payment_id)
 
 
@@ -852,14 +923,11 @@ async def publish_created_request_cards(update: Update, context: ContextTypes.DE
     if progress_msg:
         remember_progress_message(payment_id, update.effective_chat.id, progress_msg.message_id)
 
-    await mark_notified_retry(
-        payment_id,
-        admin_message_id=admin_msg.message_id,
-        manager_message_id=manager_msg.message_id,
-    )
-
-    # Button appears only after the request is fully created and message IDs are saved.
-    keyboard = manager_keyboard(payment_id, request.get("status") or "Новая")
+    # v159: do not wait for slow Apps Script message-id persistence before showing
+    # the manager cancel button. The request already exists, final cards are sent,
+    # and the local cache is enough for immediate cancel handling. Message IDs are
+    # saved in the background; if Google is slow, the UI still behaves correctly.
+    keyboard = manager_keyboard(payment_id, request.get("status") or "На оплату")
     if keyboard:
         try:
             await context.bot.edit_message_reply_markup(
@@ -871,6 +939,18 @@ async def publish_created_request_cards(update: Update, context: ContextTypes.DE
             print(f"manager cancel keyboard attach failed for {payment_id}: {err}")
     else:
         print(f"manager cancel keyboard not attached for {payment_id}: status={request.get('status')!r}")
+
+    async def _save_message_ids_background():
+        try:
+            await mark_notified_retry(
+                payment_id,
+                admin_message_id=admin_msg.message_id,
+                manager_message_id=manager_msg.message_id,
+            )
+        except Exception as err:
+            print(f"mark_notified background failed for {payment_id}: {err}")
+
+    asyncio.create_task(_save_message_ids_background())
 
 
 async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
