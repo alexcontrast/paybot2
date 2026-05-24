@@ -784,6 +784,36 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         await safe_edit_text(query.message, old_text + f"\n\n⚠️ Не удалось обновить статус: {esc(err)}", parse_mode="HTML")
         await query.answer(str(err), show_alert=True)
 
+
+
+async def recover_cancel_after_timeout(telegram_id: Any, payment_id: Any, attempts: int = 6) -> bool:
+    """После timeout отмена часто уже прошла в Apps Script.
+    Проверяем активные заявки: если заявка исчезла из активного списка или получила статус Отменено/Отклонено — считаем отмену успешной.
+    """
+    payment_id = str(payment_id or '')
+    for _ in range(max(1, attempts)):
+        await asyncio.sleep(3)
+        try:
+            result = await api_async("list_my_requests", {"telegramId": telegram_id}, timeout=45)
+            requests_list = result.get("requests", []) or []
+            found = None
+            for req in requests_list:
+                if str(req.get("paymentId") or '') == payment_id:
+                    found = req
+                    break
+            if found is None:
+                # На сервере list_my_requests не возвращает архивные заявки.
+                # Если заявка пропала из активных — значит отмена/закрытие уже применилось.
+                return True
+            status = str(found.get("status") or '')
+            if status in ["Отменено", "Отклонено", "Деньги в кассе"]:
+                return True
+        except Exception as err:
+            print(f"recover_cancel_after_timeout error: {err}")
+            continue
+    return False
+
+
 async def handle_manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Отменяю заявку…")
@@ -792,8 +822,18 @@ async def handle_manager_action(update: Update, context: ContextTypes.DEFAULT_TY
         return
     try:
         await query.edit_message_text("⏳ Отменяю заявку…")
-        api("cancel_request", {"telegramId": query.from_user.id, "paymentId": payment_id})
+        await api_async("cancel_request", {"telegramId": query.from_user.id, "paymentId": payment_id}, timeout=90)
         await query.edit_message_text("Заявка отменена.")
+    except requests.exceptions.Timeout:
+        await query.edit_message_text("⏳ Google долго отвечает. Проверяю, отменилась ли заявка…")
+        recovered = await recover_cancel_after_timeout(query.from_user.id, payment_id)
+        if recovered:
+            await query.edit_message_text("Заявка отменена.")
+        else:
+            await query.edit_message_text(
+                "Не получил подтверждение от Google, но отмена могла пройти. "
+                "Открой «Мои заявки» через минуту. Если заявки нет — она отменена."
+            )
     except Exception as err:
         await query.edit_message_text(f"Не удалось отменить заявку: {err}")
 
