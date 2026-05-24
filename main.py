@@ -86,6 +86,35 @@ async def safe_edit_text(message, text: str, reply_markup=None, parse_mode: Opti
         pass
 
 
+async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: Any, message_id: Any) -> bool:
+    if not chat_id or not message_id:
+        return False
+    try:
+        await context.bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
+        return True
+    except Exception:
+        return False
+
+
+def is_cashbox_archived(request: Dict[str, Any]) -> bool:
+    return (request.get("status") or "") == "Деньги в кассе"
+
+
+async def remove_archived_payment_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+    request: Dict[str, Any],
+    admin_message_id: Any = None,
+    manager_message_id: Any = None,
+    manager_telegram_id: Any = None,
+) -> None:
+    admin_id = admin_message_id or request.get("telegramAdminMessageId")
+    manager_msg_id = manager_message_id or request.get("telegramManagerMessageId")
+    manager_tg = manager_telegram_id or request.get("telegramId")
+    await safe_delete_message(context, ADMIN_CHAT_ID, admin_id)
+    if manager_tg and manager_msg_id:
+        await safe_delete_message(context, manager_tg, manager_msg_id)
+
+
 async def show_processing_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     if update.callback_query and update.callback_query.message:
         await update.callback_query.answer(text.replace("…", ""))
@@ -549,34 +578,45 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         result = api("admin_update", {"paymentId": payment_id, "status": status, "comment": "Telegram"})
         request = result.get("request", {})
-        await query.edit_message_text(
-            payment_text(request, "🧾 Заявка обновлена"),
-            parse_mode="HTML",
-            reply_markup=admin_keyboard(payment_id, request.get("status")),
-        )
-        manager_tg = request.get("telegramId")
-        manager_msg_id = request.get("telegramManagerMessageId")
-        if manager_tg and manager_msg_id:
-            edited = await edit_payment_message(
+
+        # Финально закрытые заявки убираем из Telegram-чата: на сайте они уже в архиве.
+        if is_cashbox_archived(request):
+            await remove_archived_payment_messages(
                 context,
-                int(manager_tg),
-                manager_msg_id,
                 request,
-                "🔔 Статус заявки обновлён",
-                is_admin=False,
+                admin_message_id=query.message.message_id,
+                manager_message_id=request.get("telegramManagerMessageId"),
+                manager_telegram_id=request.get("telegramId"),
             )
-            if not edited:
+        else:
+            await query.edit_message_text(
+                payment_text(request, "🧾 Заявка обновлена"),
+                parse_mode="HTML",
+                reply_markup=admin_keyboard(payment_id, request.get("status")),
+            )
+            manager_tg = request.get("telegramId")
+            manager_msg_id = request.get("telegramManagerMessageId")
+            if manager_tg and manager_msg_id:
+                edited = await edit_payment_message(
+                    context,
+                    int(manager_tg),
+                    manager_msg_id,
+                    request,
+                    "🔔 Статус заявки обновлён",
+                    is_admin=False,
+                )
+                if not edited:
+                    await context.bot.send_message(
+                        chat_id=int(manager_tg),
+                        text=payment_text(request, "🔔 Статус заявки обновлён"),
+                        parse_mode="HTML",
+                    )
+            elif manager_tg:
                 await context.bot.send_message(
                     chat_id=int(manager_tg),
                     text=payment_text(request, "🔔 Статус заявки обновлён"),
                     parse_mode="HTML",
                 )
-        elif manager_tg:
-            await context.bot.send_message(
-                chat_id=int(manager_tg),
-                text=payment_text(request, "🔔 Статус заявки обновлён"),
-                parse_mode="HTML",
-            )
         try:
             api("mark_status_synced", {"paymentId": payment_id})
         except Exception:
@@ -584,7 +624,6 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as err:
         await safe_edit_text(query.message, old_text + f"\n\n⚠️ Не удалось обновить статус: {esc(err)}", parse_mode="HTML")
         await query.answer(str(err), show_alert=True)
-
 
 async def handle_manager_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -625,24 +664,33 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
             manager_msg_id = request.get("telegramManagerMessageId")
             manager_tg = request.get("telegramId")
 
-            await edit_payment_message(
-                context,
-                ADMIN_CHAT_ID,
-                admin_msg_id,
-                request,
-                "🧾 Заявка обновлена",
-                is_admin=True,
-            )
-
-            if manager_tg and manager_msg_id:
+            if is_cashbox_archived(request):
+                await remove_archived_payment_messages(
+                    context,
+                    request,
+                    admin_message_id=admin_msg_id,
+                    manager_message_id=manager_msg_id,
+                    manager_telegram_id=manager_tg,
+                )
+            else:
                 await edit_payment_message(
                     context,
-                    int(manager_tg),
-                    manager_msg_id,
+                    ADMIN_CHAT_ID,
+                    admin_msg_id,
                     request,
-                    "🔔 Статус заявки обновлён",
-                    is_admin=False,
+                    "🧾 Заявка обновлена",
+                    is_admin=True,
                 )
+
+                if manager_tg and manager_msg_id:
+                    await edit_payment_message(
+                        context,
+                        int(manager_tg),
+                        manager_msg_id,
+                        request,
+                        "🔔 Статус заявки обновлён",
+                        is_admin=False,
+                    )
 
             try:
                 api("mark_status_synced", {"paymentId": payment_id})
@@ -650,7 +698,6 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
                 pass
     except Exception as err:
         print(f"poll_status_updates error: {err}")
-
 
 async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
     try:
