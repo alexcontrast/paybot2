@@ -59,6 +59,8 @@ PAYMENT_METHODS = ["По счету", "На карту", "Нал"]
 EXTRA_ITEM_ORDER = -1
 FLOW_CACHE = {}
 FLOW_CACHE_TTL_SECONDS = 180
+ITEM_CACHE = {}
+ITEM_CACHE_TTL_SECONDS = 300
 
 
 
@@ -146,6 +148,50 @@ async def load_flow_data(telegram_id: Any, prefer_cache: bool = True) -> Dict[st
         result = await api_async('list_flow', {'telegramId': telegram_id}, timeout=120)
 
     set_local_flow_cache(telegram_id, result)
+    return result
+
+
+def item_cache_key(telegram_id: Any, event_id: Any) -> str:
+    return f"{telegram_id}:{event_id}"
+
+def get_local_item_cache(telegram_id: Any, event_id: Any) -> Optional[Dict[str, Any]]:
+    key = item_cache_key(telegram_id, event_id)
+    item = ITEM_CACHE.get(key)
+    if not item:
+        return None
+    if time.time() - float(item.get('ts', 0)) > ITEM_CACHE_TTL_SECONDS:
+        ITEM_CACHE.pop(key, None)
+        return None
+    return item.get('data')
+
+def set_local_item_cache(telegram_id: Any, event_id: Any, data: Dict[str, Any]) -> None:
+    key = item_cache_key(telegram_id, event_id)
+    if not event_id:
+        return
+    ITEM_CACHE[key] = {'ts': time.time(), 'data': data or {}}
+
+def clear_local_item_cache(telegram_id: Any, event_id: Any = None) -> None:
+    if event_id:
+        ITEM_CACHE.pop(item_cache_key(telegram_id, event_id), None)
+        return
+    prefix = f"{telegram_id}:"
+    for key in list(ITEM_CACHE.keys()):
+        if key.startswith(prefix):
+            ITEM_CACHE.pop(key, None)
+
+async def load_items_data(telegram_id: Any, event_id: Any, prefer_cache: bool = True) -> Dict[str, Any]:
+    if prefer_cache:
+        cached = get_local_item_cache(telegram_id, event_id)
+        if cached:
+            return dict(cached, localCached=True)
+    try:
+        result = await api_async("list_items_ultra", {"telegramId": telegram_id, "eventId": event_id}, timeout=45)
+    except Exception as err:
+        err_text = str(err)
+        if 'list_items_ultra' not in err_text and 'Неизвестное действие' not in err_text:
+            raise
+        result = await api_async("list_items_fast", {"telegramId": telegram_id, "eventId": event_id}, timeout=90)
+    set_local_item_cache(telegram_id, event_id, result)
     return result
 
 
@@ -561,7 +607,7 @@ async def choose_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{event.get('customerName')} · {event.get('eventName')}\n"
         f"Дата: {event.get('eventDate')}\n\n⏳ Загружаю позиции…"
     )
-    result = await api_async("list_items_fast", {"telegramId": query.from_user.id, "eventId": event.get("eventId")}, timeout=120)
+    result = await load_items_data(query.from_user.id, event.get("eventId"), prefer_cache=True)
     context.user_data["items"] = result.get("overview", [])
     context.user_data["allow_extra"] = bool(result.get("allowExtraPosition"))
     await query.edit_message_text(
@@ -737,8 +783,17 @@ async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_T
     }
 
     try:
-        result = await api_async("create_request_fast", {"telegramId": update.effective_user.id, "payload": payload}, timeout=120)
+        try:
+            result = await api_async("create_request_instant", {"telegramId": update.effective_user.id, "payload": payload}, timeout=45)
+        except Exception as instant_err:
+            err_text = str(instant_err)
+            if 'create_request_instant' not in err_text and 'Неизвестное действие' not in err_text:
+                raise
+            result = await api_async("create_request_fast", {"telegramId": update.effective_user.id, "payload": payload}, timeout=90)
         request = result.get("request", {})
+        if payload.get("itemOrder") == EXTRA_ITEM_ORDER:
+            clear_local_item_cache(update.effective_user.id, payload.get("eventId"))
+            FLOW_CACHE.pop(flow_cache_key(update.effective_user.id), None)
         await publish_created_request_cards(update, context, request, progress_msg=progress_msg)
         await remove_progress_message(context, request.get("paymentId"))
         await update.message.reply_text("Готово. Заявка ушла админу и появилась на сайте.", reply_markup=MAIN_KEYBOARD)
@@ -844,7 +899,7 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
                     parse_mode="HTML",
                 )
         try:
-            api("mark_status_synced", {"paymentId": payment_id})
+            api("mark_status_synced", {"paymentId": payment_id, "status": request.get("status")})
         except Exception:
             pass
     except Exception as err:
@@ -964,7 +1019,7 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
                     )
 
             try:
-                api("mark_status_synced", {"paymentId": payment_id})
+                api("mark_status_synced", {"paymentId": payment_id, "status": request.get("status")})
             except Exception:
                 pass
     except Exception as err:
