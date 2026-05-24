@@ -1,5 +1,8 @@
 RECENTLY_PUBLISHED_PAYMENT_IDS = {}
 RECENTLY_PUBLISHED_TTL_SECONDS = 10 * 60
+PAYMENT_MESSAGE_CACHE = {}
+PENDING_PROGRESS_BY_PAYMENT_ID = {}
+
 import os
 import re
 import html
@@ -184,7 +187,43 @@ async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: Any, 
 
 
 def is_cashbox_archived(request: Dict[str, Any]) -> bool:
-    return (request.get("status") or "") == "Деньги в кассе"
+    """Telegram should remove terminal/archived request cards from chats."""
+    return (request.get("status") or "") in ["Деньги в кассе", "Отменено", "Отклонено"]
+
+
+def remember_payment_messages(payment_id: Any, admin_message_id: Any = None, manager_message_id: Any = None, manager_telegram_id: Any = None) -> None:
+    if not payment_id:
+        return
+    key = str(payment_id)
+    item = PAYMENT_MESSAGE_CACHE.get(key, {})
+    if admin_message_id:
+        item["admin_message_id"] = admin_message_id
+    if manager_message_id:
+        item["manager_message_id"] = manager_message_id
+    if manager_telegram_id:
+        item["manager_telegram_id"] = manager_telegram_id
+    item["updated_at"] = time.time()
+    PAYMENT_MESSAGE_CACHE[key] = item
+
+
+def remember_progress_message(payment_id: Any, chat_id: Any, message_id: Any) -> None:
+    if payment_id and chat_id and message_id:
+        PENDING_PROGRESS_BY_PAYMENT_ID[str(payment_id)] = {"chat_id": chat_id, "message_id": message_id, "updated_at": time.time()}
+
+
+async def remove_progress_message(context: ContextTypes.DEFAULT_TYPE, payment_id: Any) -> None:
+    item = PENDING_PROGRESS_BY_PAYMENT_ID.pop(str(payment_id or ""), None)
+    if item:
+        await safe_delete_message(context, item.get("chat_id"), item.get("message_id"))
+
+
+async def remove_payment_messages_by_id(context: ContextTypes.DEFAULT_TYPE, payment_id: Any, manager_telegram_id: Any = None) -> None:
+    key = str(payment_id or "")
+    item = PAYMENT_MESSAGE_CACHE.pop(key, {})
+    await safe_delete_message(context, ADMIN_CHAT_ID, item.get("admin_message_id"))
+    manager_tg = manager_telegram_id or item.get("manager_telegram_id")
+    await safe_delete_message(context, manager_tg, item.get("manager_message_id"))
+    await remove_progress_message(context, payment_id)
 
 
 async def remove_archived_payment_messages(
@@ -194,12 +233,15 @@ async def remove_archived_payment_messages(
     manager_message_id: Any = None,
     manager_telegram_id: Any = None,
 ) -> None:
-    admin_id = admin_message_id or request.get("telegramAdminMessageId")
-    manager_msg_id = manager_message_id or request.get("telegramManagerMessageId")
-    manager_tg = manager_telegram_id or request.get("telegramId")
+    payment_id = request.get("paymentId")
+    cached = PAYMENT_MESSAGE_CACHE.pop(str(payment_id or ""), {})
+    admin_id = admin_message_id or request.get("telegramAdminMessageId") or cached.get("admin_message_id")
+    manager_msg_id = manager_message_id or request.get("telegramManagerMessageId") or cached.get("manager_message_id")
+    manager_tg = manager_telegram_id or request.get("telegramId") or cached.get("manager_telegram_id")
     await safe_delete_message(context, ADMIN_CHAT_ID, admin_id)
     if manager_tg and manager_msg_id:
         await safe_delete_message(context, manager_tg, manager_msg_id)
+    await remove_progress_message(context, payment_id)
 
 
 async def show_processing_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -654,7 +696,7 @@ def is_recently_published(payment_id: Any) -> bool:
     return bool(ts and now - ts <= RECENTLY_PUBLISHED_TTL_SECONDS)
 
 
-async def publish_created_request_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, request: Dict[str, Any], title: str = "🧾 Заявка создана") -> None:
+async def publish_created_request_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, request: Dict[str, Any], title: str = "🧾 Заявка создана", progress_msg=None) -> None:
     remember_recently_published(request.get("paymentId"))
     manager_msg = await update.message.reply_html(
         payment_text(request, title),
@@ -666,6 +708,9 @@ async def publish_created_request_cards(update: Update, context: ContextTypes.DE
         parse_mode="HTML",
         reply_markup=admin_keyboard(request.get("paymentId"), request.get("status")),
     )
+    remember_payment_messages(request.get("paymentId"), admin_msg.message_id, manager_msg.message_id, update.effective_user.id)
+    if progress_msg:
+        remember_progress_message(request.get("paymentId"), update.effective_chat.id, progress_msg.message_id)
     await mark_notified_retry(
         request.get("paymentId"),
         admin_message_id=admin_msg.message_id,
@@ -694,8 +739,8 @@ async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_T
     try:
         result = await api_async("create_request_fast", {"telegramId": update.effective_user.id, "payload": payload}, timeout=120)
         request = result.get("request", {})
-        await publish_created_request_cards(update, context, request)
-        await safe_edit_text(progress_msg, "✅ Заявка записана.")
+        await publish_created_request_cards(update, context, request, progress_msg=progress_msg)
+        await remove_progress_message(context, request.get("paymentId"))
         await update.message.reply_text("Готово. Заявка ушла админу и появилась на сайте.", reply_markup=MAIN_KEYBOARD)
 
     except requests.exceptions.Timeout:
@@ -705,10 +750,10 @@ async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_T
         recovered = await recover_created_request_after_timeout(update, context, payload)
         if recovered:
             try:
-                await publish_created_request_cards(update, context, recovered, "🧾 Заявка создана")
+                await publish_created_request_cards(update, context, recovered, "🧾 Заявка создана", progress_msg=progress_msg)
             except Exception as err:
                 print(f"publish recovered request error: {err}")
-            await safe_edit_text(progress_msg, "✅ Заявка записана.")
+            await remove_progress_message(context, recovered.get("paymentId"))
             await update.message.reply_text("Готово. Заявка появилась на сайте. Повторно отправлять не нужно.", reply_markup=MAIN_KEYBOARD)
         else:
             await safe_edit_text(progress_msg, "⏳ Не получил подтверждение от Google, но заявка могла записаться.")
@@ -845,12 +890,16 @@ async def handle_manager_action(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         await query.edit_message_text("⏳ Отменяю заявку…")
         await api_async("cancel_request", {"telegramId": query.from_user.id, "paymentId": payment_id}, timeout=90)
-        await query.edit_message_text("Заявка отменена.")
+        await remove_payment_messages_by_id(context, payment_id, manager_telegram_id=query.from_user.id)
+        await safe_delete_message(context, query.message.chat_id, query.message.message_id)
+        await context.bot.send_message(chat_id=query.from_user.id, text="Заявка отменена.", reply_markup=MAIN_KEYBOARD)
     except requests.exceptions.Timeout:
         await query.edit_message_text("⏳ Google долго отвечает. Проверяю, отменилась ли заявка…")
         recovered = await recover_cancel_after_timeout(query.from_user.id, payment_id)
         if recovered:
-            await query.edit_message_text("Заявка отменена.")
+            await remove_payment_messages_by_id(context, payment_id, manager_telegram_id=query.from_user.id)
+            await safe_delete_message(context, query.message.chat_id, query.message.message_id)
+            await context.bot.send_message(chat_id=query.from_user.id, text="Заявка отменена.", reply_markup=MAIN_KEYBOARD)
         else:
             await query.edit_message_text(
                 "Не получил подтверждение от Google, но отмена могла пройти. "
@@ -894,6 +943,7 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
                     manager_telegram_id=manager_tg,
                 )
             else:
+                remember_payment_messages(payment_id, admin_msg_id, manager_msg_id, manager_tg)
                 await edit_payment_message(
                     context,
                     ADMIN_CHAT_ID,
@@ -947,6 +997,7 @@ async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     manager_msg_id = ""
             remember_recently_published(payment_id)
+            remember_payment_messages(payment_id, admin_msg.message_id, manager_msg_id, manager_tg)
             await mark_notified_retry(
                 payment_id,
                 admin_message_id=admin_msg.message_id,
