@@ -1,6 +1,8 @@
 import os
 import re
 import html
+import asyncio
+from types import SimpleNamespace
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -77,6 +79,38 @@ def api(action: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not result.get("ok"):
         raise RuntimeError(result.get("error") or "Ошибка Apps Script API")
     return result
+
+
+async def api_retry(action: str, data: Optional[Dict[str, Any]] = None, attempts: int = 3, delay: float = 2.0) -> Dict[str, Any]:
+    last_error = None
+    for attempt in range(max(1, attempts)):
+        try:
+            return api(action, data)
+        except Exception as err:
+            last_error = err
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay)
+    raise last_error
+
+
+async def mark_notified_retry(payment_id: Any, admin_message_id: Any = None, manager_message_id: Any = None) -> bool:
+    if not payment_id:
+        return False
+    try:
+        await api_retry(
+            "mark_notified",
+            {
+                "paymentId": payment_id,
+                "adminMessageId": admin_message_id or "",
+                "managerMessageId": manager_message_id or "",
+            },
+            attempts=4,
+            delay=2.5,
+        )
+        return True
+    except Exception as err:
+        print(f"mark_notified failed for {payment_id}: {err}")
+        return False
 
 
 async def safe_edit_text(message, text: str, reply_markup=None, parse_mode: Optional[str] = None) -> None:
@@ -526,14 +560,11 @@ async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_T
             parse_mode="HTML",
             reply_markup=admin_keyboard(request.get("paymentId"), request.get("status")),
         )
-        try:
-            api("mark_notified", {
-                "paymentId": request.get("paymentId"),
-                "adminMessageId": admin_msg.message_id,
-                "managerMessageId": manager_msg.message_id,
-            })
-        except Exception:
-            pass
+        await mark_notified_retry(
+            request.get("paymentId"),
+            admin_message_id=admin_msg.message_id,
+            manager_message_id=manager_msg.message_id,
+        )
         await safe_edit_text(progress_msg, "✅ Заявка записана.")
         await update.message.reply_text("Готово. Заявка ушла админу и появилась на сайте.", reply_markup=MAIN_KEYBOARD)
     except Exception as err:
@@ -723,16 +754,35 @@ async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
                     manager_msg_id = manager_msg.message_id
                 except Exception:
                     manager_msg_id = ""
-            try:
-                api("mark_notified", {
-                    "paymentId": payment_id,
-                    "adminMessageId": admin_msg.message_id,
-                    "managerMessageId": manager_msg_id,
-                })
-            except Exception:
-                pass
+            await mark_notified_retry(
+                payment_id,
+                admin_message_id=admin_msg.message_id,
+                manager_message_id=manager_msg_id,
+            )
     except Exception as err:
         print(f"poll_site_requests error: {err}")
+
+
+async def bot_background_loop(application, worker, name: str, first: int, interval: int):
+    await asyncio.sleep(max(0, first))
+    context = SimpleNamespace(bot=application.bot)
+    while True:
+        try:
+            await worker(context)
+        except Exception as err:
+            print(f"{name} background error: {err}")
+        await asyncio.sleep(max(5, interval))
+
+
+async def post_init(application):
+    # Не зависим от optional JobQueue. Railway часто ставит python-telegram-bot без [job-queue],
+    # из-за этого фоновые обновления статусов раньше могли вообще не запускаться.
+    application.create_task(
+        bot_background_loop(application, poll_site_requests, "poll_site_requests", 10, POLL_SITE_REQUESTS_SECONDS)
+    )
+    application.create_task(
+        bot_background_loop(application, poll_status_updates, "poll_status_updates", 15, POLL_SITE_REQUESTS_SECONDS)
+    )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -743,7 +793,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     require_env()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     bind_conversation = ConversationHandler(
         entry_points=[CommandHandler("start", start), MessageHandler(filters.Regex("^Привязать аккаунт$"), bind_start)],
@@ -775,12 +825,6 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_admin_action, pattern="^admin:"))
     app.add_handler(CallbackQueryHandler(handle_manager_action, pattern="^manager:"))
     app.add_handler(CommandHandler("cancel", cancel))
-
-    if app.job_queue:
-        app.job_queue.run_repeating(poll_site_requests, interval=POLL_SITE_REQUESTS_SECONDS, first=10)
-        app.job_queue.run_repeating(poll_status_updates, interval=POLL_SITE_REQUESTS_SECONDS, first=15)
-    else:
-        print("JobQueue недоступен. Установи python-telegram-bot[job-queue], чтобы бот уведомлял о заявках с сайта.")
 
     app.run_polling()
 
