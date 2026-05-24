@@ -4,6 +4,7 @@ import html
 import asyncio
 from types import SimpleNamespace
 from datetime import datetime
+import time
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -51,6 +52,9 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 
 PAYMENT_METHODS = ["По счету", "На карту", "Нал"]
 EXTRA_ITEM_ORDER = -1
+FLOW_CACHE = {}
+FLOW_CACHE_TTL_SECONDS = 180
+
 
 
 def require_env() -> None:
@@ -67,13 +71,13 @@ def require_env() -> None:
         raise RuntimeError("Не заданы переменные окружения: " + ", ".join(missing))
 
 
-def api(action: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def api(action: str, data: Optional[Dict[str, Any]] = None, timeout: int = 120) -> Dict[str, Any]:
     payload = {
         "secret": BOT_API_SECRET,
         "action": action,
         "data": data or {},
     }
-    response = requests.post(APPS_SCRIPT_URL, json=payload, timeout=90)
+    response = requests.post(APPS_SCRIPT_URL, json=payload, timeout=timeout)
     response.raise_for_status()
     result = response.json()
     if not result.get("ok"):
@@ -91,6 +95,43 @@ async def api_retry(action: str, data: Optional[Dict[str, Any]] = None, attempts
             if attempt < attempts - 1:
                 await asyncio.sleep(delay)
     raise last_error
+
+
+async def api_async(action: str, data: Optional[Dict[str, Any]] = None, timeout: int = 120) -> Dict[str, Any]:
+    # requests блокирующий; уносим его в отдельный поток, чтобы бот не замирал целиком.
+    return await asyncio.to_thread(api, action, data, timeout)
+
+
+def flow_cache_key(telegram_id: Any) -> str:
+    return str(telegram_id or '').strip()
+
+
+def get_local_flow_cache(telegram_id: Any) -> Optional[Dict[str, Any]]:
+    key = flow_cache_key(telegram_id)
+    item = FLOW_CACHE.get(key)
+    if not item:
+        return None
+    if time.time() - float(item.get('ts', 0)) > FLOW_CACHE_TTL_SECONDS:
+        FLOW_CACHE.pop(key, None)
+        return None
+    return item.get('data')
+
+
+def set_local_flow_cache(telegram_id: Any, data: Dict[str, Any]) -> None:
+    key = flow_cache_key(telegram_id)
+    if not key:
+        return
+    FLOW_CACHE[key] = {'ts': time.time(), 'data': data or {}}
+
+
+async def load_flow_data(telegram_id: Any, prefer_cache: bool = True) -> Dict[str, Any]:
+    if prefer_cache:
+        cached = get_local_flow_cache(telegram_id)
+        if cached:
+            return dict(cached, localCached=True)
+    result = await api_async('list_flow_fast', {'telegramId': telegram_id}, timeout=120)
+    set_local_flow_cache(telegram_id, result)
+    return result
 
 
 async def mark_notified_retry(payment_id: Any, admin_message_id: Any = None, manager_message_id: Any = None) -> bool:
@@ -401,7 +442,7 @@ async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     try:
         status_msg = await update.message.reply_text("⏳ Загружаю мероприятия…")
-        result = api("list_flow", {"telegramId": update.effective_user.id})
+        result = await load_flow_data(update.effective_user.id, prefer_cache=True)
         months = result.get("months", [])
         events_by_month = result.get("eventsByMonth", {})
         if not months:
@@ -413,7 +454,9 @@ async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("Выбери месяц мероприятия:", reply_markup=month_keyboard(months))
         return CHOOSE_MONTH
     except Exception as err:
-        await update.message.reply_text(f"Не удалось загрузить мероприятия: {err}", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text(f"Не удалось загрузить мероприятия: {err}
+
+Попробуй нажать «Новая заявка» ещё раз. Если кэш уже успел сохраниться, следующий заход откроется быстрее.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
 
 
@@ -439,7 +482,7 @@ async def new_request_from_query(query, context: ContextTypes.DEFAULT_TYPE):
     months = context.user_data.get("months", [])
     if not months:
         await safe_edit_text(query.message, "⏳ Загружаю мероприятия…")
-        result = api("list_flow", {"telegramId": query.from_user.id})
+        result = await load_flow_data(query.from_user.id, prefer_cache=True)
         months = result.get("months", [])
         context.user_data["months"] = months
         context.user_data["events_by_month"] = result.get("eventsByMonth", {})
@@ -460,7 +503,7 @@ async def choose_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{event.get('customerName')} · {event.get('eventName')}\n"
         f"Дата: {event.get('eventDate')}\n\n⏳ Загружаю позиции…"
     )
-    result = api("list_items_fast", {"telegramId": query.from_user.id, "eventId": event.get("eventId")})
+    result = await api_async("list_items_fast", {"telegramId": query.from_user.id, "eventId": event.get("eventId")}, timeout=120)
     context.user_data["items"] = result.get("overview", [])
     context.user_data["allow_extra"] = bool(result.get("allowExtraPosition"))
     await query.edit_message_text(
