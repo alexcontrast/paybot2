@@ -122,6 +122,15 @@ def esc(value: Any) -> str:
     return html.escape(str(value or ""))
 
 
+def format_card_number_for_telegram(value: Any) -> str:
+    digits = re.sub(r"\D", "", str(value or ""))
+    if not digits:
+        return ""
+    if len(digits) == 16:
+        return " ".join(digits[i:i + 4] for i in range(0, 16, 4))
+    return str(value or "").strip()
+
+
 def short(text: str, limit: int = 42) -> str:
     value = str(text or "").strip()
     return value if len(value) <= limit else value[: limit - 1] + "…"
@@ -179,13 +188,43 @@ def manager_keyboard(payment_id: str, status: str) -> Optional[InlineKeyboardMar
     return None
 
 
+def payment_status_label(status: str) -> str:
+    normalized = status or "Новая"
+    if normalized == "Новая":
+        return "🕒 На оплату"
+    if normalized == "Оплачено":
+        return "✅ Оплачено"
+    if normalized == "Деньги в кассе":
+        return "✅ Оплачено"
+    if normalized in ["Отменено", "Отклонено"]:
+        return "❌ Отменено" if normalized == "Отменено" else "❌ Отклонено"
+    return normalized
+
+
+def money_status_label(status: str) -> str:
+    normalized = status or "Новая"
+    if normalized == "Деньги в кассе":
+        return "✅ Деньги в кассе"
+    if normalized in ["Отменено", "Отклонено"]:
+        return ""
+    return "💰 Ждем деньги"
+
+
+def is_active_request_for_manager(request: Dict[str, Any]) -> bool:
+    status = request.get("status") or "Новая"
+    return status in ["Новая", "Оплачено"]
+
+
 def payment_text(request: Dict[str, Any], title: str = "🧾 Заявка на оплату") -> str:
     status = request.get("status") or "Новая"
-    money_status = "Деньги в кассе" if status == "Деньги в кассе" else ("Отменено" if status in ["Отменено", "Отклонено"] else "Ждем деньги")
+    payment_status = payment_status_label(status)
+    money_status = money_status_label(status)
     card = request.get("cardNumber") or ""
-    card_line = f"\nКарта: <code>{esc(card)}</code>" if card else ""
+    card_display = format_card_number_for_telegram(card)
+    card_line = f"\nКарта: <code>{esc(card_display)}</code>" if card_display else ""
     extra_comment = request.get("managerComment") or ""
     comment_line = f"\nКомментарий: {esc(extra_comment)}" if extra_comment else ""
+    money_line = f"\nСтатус денег: <b>{esc(money_status)}</b>" if money_status else ""
     return (
         f"{esc(title)}\n\n"
         f"№: <b>{esc(request.get('paymentId'))}</b>\n"
@@ -197,8 +236,8 @@ def payment_text(request: Dict[str, Any], title: str = "🧾 Заявка на �
         f"Подрядчик: {esc(request.get('contractorName'))}\n"
         f"Способ оплаты: {esc(request.get('requestPaymentType'))}{card_line}\n"
         f"Сумма заявки: <b>{fmt_money(request.get('requestAmount'))}</b>{comment_line}\n\n"
-        f"Статус оплаты: <b>{'На оплату' if status == 'Новая' else esc(status)}</b>\n"
-        f"Статус денег: <b>{esc(money_status)}</b>"
+        f"Статус оплаты: <b>{esc(payment_status)}</b>"
+        f"{money_line}"
     )
 
 
@@ -484,7 +523,7 @@ async def my_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     progress_msg = await update.message.reply_text("⏳ Загружаю заявки…")
     try:
         result = api("list_my_requests", {"telegramId": update.effective_user.id})
-        requests_list = result.get("requests", [])[:10]
+        requests_list = [r for r in result.get("requests", []) if is_active_request_for_manager(r)][:10]
         if not requests_list:
             await safe_edit_text(progress_msg, "Заявок пока нет.")
             await update.message.reply_text("Главное меню:", reply_markup=MAIN_KEYBOARD)
@@ -516,12 +555,32 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=admin_keyboard(payment_id, request.get("status")),
         )
         manager_tg = request.get("telegramId")
-        if manager_tg:
+        manager_msg_id = request.get("telegramManagerMessageId")
+        if manager_tg and manager_msg_id:
+            edited = await edit_payment_message(
+                context,
+                int(manager_tg),
+                manager_msg_id,
+                request,
+                "🔔 Статус заявки обновлён",
+                is_admin=False,
+            )
+            if not edited:
+                await context.bot.send_message(
+                    chat_id=int(manager_tg),
+                    text=payment_text(request, "🔔 Статус заявки обновлён"),
+                    parse_mode="HTML",
+                )
+        elif manager_tg:
             await context.bot.send_message(
                 chat_id=int(manager_tg),
                 text=payment_text(request, "🔔 Статус заявки обновлён"),
                 parse_mode="HTML",
             )
+        try:
+            api("mark_status_synced", {"paymentId": payment_id})
+        except Exception:
+            pass
     except Exception as err:
         await safe_edit_text(query.message, old_text + f"\n\n⚠️ Не удалось обновить статус: {esc(err)}", parse_mode="HTML")
         await query.answer(str(err), show_alert=True)
@@ -539,6 +598,58 @@ async def handle_manager_action(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("Заявка отменена.")
     except Exception as err:
         await query.edit_message_text(f"Не удалось отменить заявку: {err}")
+
+
+async def edit_payment_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: Any, request: Dict[str, Any], title: str, is_admin: bool = False) -> bool:
+    if not chat_id or not message_id:
+        return False
+    try:
+        await context.bot.edit_message_text(
+            chat_id=int(chat_id),
+            message_id=int(message_id),
+            text=payment_text(request, title),
+            parse_mode="HTML",
+            reply_markup=admin_keyboard(request.get("paymentId"), request.get("status")) if is_admin else manager_keyboard(request.get("paymentId"), request.get("status")),
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        result = api("list_status_updates", {})
+        for request in result.get("requests", []):
+            payment_id = request.get("paymentId")
+            admin_msg_id = request.get("telegramAdminMessageId")
+            manager_msg_id = request.get("telegramManagerMessageId")
+            manager_tg = request.get("telegramId")
+
+            await edit_payment_message(
+                context,
+                ADMIN_CHAT_ID,
+                admin_msg_id,
+                request,
+                "🧾 Заявка обновлена",
+                is_admin=True,
+            )
+
+            if manager_tg and manager_msg_id:
+                await edit_payment_message(
+                    context,
+                    int(manager_tg),
+                    manager_msg_id,
+                    request,
+                    "🔔 Статус заявки обновлён",
+                    is_admin=False,
+                )
+
+            try:
+                api("mark_status_synced", {"paymentId": payment_id})
+            except Exception:
+                pass
+    except Exception as err:
+        print(f"poll_status_updates error: {err}")
 
 
 async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
@@ -620,6 +731,7 @@ def main():
 
     if app.job_queue:
         app.job_queue.run_repeating(poll_site_requests, interval=POLL_SITE_REQUESTS_SECONDS, first=10)
+        app.job_queue.run_repeating(poll_status_updates, interval=POLL_SITE_REQUESTS_SECONDS, first=15)
     else:
         print("JobQueue недоступен. Установи python-telegram-bot[job-queue], чтобы бот уведомлял о заявках с сайта.")
 
