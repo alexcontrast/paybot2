@@ -807,25 +807,48 @@ def is_recently_published(payment_id: Any) -> bool:
 
 
 async def publish_created_request_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, request: Dict[str, Any], title: str = "🧾 Заявка создана", progress_msg=None) -> None:
+    """Publish final request cards.
+
+    v156: while a request is still being sent/registered, the manager must not see
+    the cancel button. We first send the final card without inline buttons, save the
+    Telegram message IDs in Apps Script, and only after that attach "Отменить заявку".
+    This prevents parallel cancel clicks during slow Google/App Script responses.
+    """
     remember_recently_published(request.get("paymentId"))
+    payment_id = request.get("paymentId")
+
     manager_msg = await update.message.reply_html(
         payment_text(request, title),
-        reply_markup=manager_keyboard(request.get("paymentId"), request.get("status")),
+        reply_markup=None,
     )
     admin_msg = await context.bot.send_message(
         chat_id=ADMIN_CHAT_ID,
         text=payment_text(request, "🧾 Новая заявка на оплату"),
         parse_mode="HTML",
-        reply_markup=admin_keyboard(request.get("paymentId"), request.get("status")),
+        reply_markup=admin_keyboard(payment_id, request.get("status")),
     )
-    remember_payment_messages(request.get("paymentId"), admin_msg.message_id, manager_msg.message_id, update.effective_user.id)
+
+    remember_payment_messages(payment_id, admin_msg.message_id, manager_msg.message_id, update.effective_user.id)
     if progress_msg:
-        remember_progress_message(request.get("paymentId"), update.effective_chat.id, progress_msg.message_id)
+        remember_progress_message(payment_id, update.effective_chat.id, progress_msg.message_id)
+
     await mark_notified_retry(
-        request.get("paymentId"),
+        payment_id,
         admin_message_id=admin_msg.message_id,
         manager_message_id=manager_msg.message_id,
     )
+
+    # Button appears only after the request is fully created and message IDs are saved.
+    keyboard = manager_keyboard(payment_id, request.get("status"))
+    if keyboard:
+        try:
+            await context.bot.edit_message_reply_markup(
+                chat_id=update.effective_user.id,
+                message_id=manager_msg.message_id,
+                reply_markup=keyboard,
+            )
+        except Exception as err:
+            print(f"manager cancel keyboard attach failed for {payment_id}: {err}")
 
 
 async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
