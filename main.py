@@ -61,6 +61,7 @@ FLOW_CACHE = {}
 FLOW_CACHE_TTL_SECONDS = 180
 ITEM_CACHE = {}
 ITEM_CACHE_TTL_SECONDS = 300
+FLOW_CLEANUP_KEY = "payment_flow_message_ids"
 
 
 
@@ -230,6 +231,53 @@ async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: Any, 
         return True
     except Exception:
         return False
+
+
+def reset_payment_flow_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data[FLOW_CLEANUP_KEY] = []
+
+
+def track_flow_message_id(context: ContextTypes.DEFAULT_TYPE, message_id: Any) -> None:
+    if not message_id:
+        return
+    ids = context.user_data.setdefault(FLOW_CLEANUP_KEY, [])
+    try:
+        mid = int(message_id)
+    except Exception:
+        return
+    if mid not in ids:
+        ids.append(mid)
+
+
+def track_update_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message:
+        track_flow_message_id(context, update.message.message_id)
+    elif update.callback_query and update.callback_query.message:
+        track_flow_message_id(context, update.callback_query.message.message_id)
+
+
+def track_bot_message(context: ContextTypes.DEFAULT_TYPE, message) -> None:
+    if message:
+        track_flow_message_id(context, getattr(message, "message_id", None))
+
+
+async def cleanup_payment_flow_messages(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: Any,
+    keep_message_ids: Optional[List[Any]] = None,
+) -> None:
+    keep = set()
+    for item in keep_message_ids or []:
+        try:
+            keep.add(int(item))
+        except Exception:
+            pass
+    ids = list(context.user_data.get(FLOW_CLEANUP_KEY, []) or [])
+    context.user_data[FLOW_CLEANUP_KEY] = []
+    for message_id in ids:
+        if int(message_id) in keep:
+            continue
+        await safe_delete_message(context, chat_id, message_id)
 
 
 def is_cashbox_archived(request: Dict[str, Any]) -> bool:
@@ -536,12 +584,15 @@ async def bind_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return ConversationHandler.END
+    reset_payment_flow_cleanup(context)
+    track_update_message(update, context)
     user = await ensure_bound(update, context)
     if not user:
         await update.message.reply_text("Сначала привяжи аккаунт: /start")
         return ConversationHandler.END
     try:
         status_msg = await update.message.reply_text("⏳ Загружаю мероприятия…")
+        track_bot_message(context, status_msg)
         result = await load_flow_data(update.effective_user.id, prefer_cache=True)
         months = result.get("months", [])
         events_by_month = result.get("eventsByMonth", {})
@@ -565,6 +616,7 @@ async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def choose_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_update_message(update, context)
     query = update.callback_query
     await query.answer("Открываю месяц…")
     if query.data == "back:months":
@@ -595,6 +647,7 @@ async def new_request_from_query(query, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def choose_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_update_message(update, context)
     query = update.callback_query
     await query.answer("Загружаю позиции…")
     if query.data == "back:months":
@@ -619,6 +672,7 @@ async def choose_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def choose_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_update_message(update, context)
     query = update.callback_query
     await query.answer("Открываю позицию…")
     if query.data == "back:events":
@@ -637,26 +691,33 @@ async def choose_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def extra_position_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_update_message(update, context)
     name = update.message.text.strip()
     if not name:
-        await update.message.reply_text("Название не должно быть пустым. Введи название новой позиции:")
+        err_msg = await update.message.reply_text("Название не должно быть пустым. Введи название новой позиции:")
+        track_bot_message(context, err_msg)
         return EXTRA_POSITION_NAME
     context.user_data["new_position_name"] = name
-    await update.message.reply_text("Теперь введи сумму заявки:")
+    prompt_msg = await update.message.reply_text("Теперь введи сумму заявки:")
+    track_bot_message(context, prompt_msg)
     return AMOUNT
 
 
 async def get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_update_message(update, context)
     amount = money_number(update.message.text)
     if not amount:
-        await update.message.reply_text("Сумма должна быть числом. Например: 250000 или 250 000")
+        err_msg = await update.message.reply_text("Сумма должна быть числом. Например: 250000 или 250 000")
+        track_bot_message(context, err_msg)
         return AMOUNT
     context.user_data["amount"] = amount
-    await update.message.reply_text("Выбери способ оплаты:", reply_markup=payment_method_keyboard())
+    prompt_msg = await update.message.reply_text("Выбери способ оплаты:", reply_markup=payment_method_keyboard())
+    track_bot_message(context, prompt_msg)
     return PAYMENT_METHOD
 
 
 async def choose_payment_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_update_message(update, context)
     query = update.callback_query
     await query.answer("Выбран способ оплаты")
     method = query.data.replace("paymethod:", "")
@@ -669,12 +730,15 @@ async def choose_payment_method(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def get_card_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_update_message(update, context)
     digits = re.sub(r"\D", "", update.message.text or "")
     if len(digits) != 16:
-        await update.message.reply_text("Номер карты должен содержать ровно 16 цифр. Попробуй ещё раз:")
+        err_msg = await update.message.reply_text("Номер карты должен содержать ровно 16 цифр. Попробуй ещё раз:")
+        track_bot_message(context, err_msg)
         return CARD_NUMBER
     context.user_data["card_number"] = digits
-    await update.message.reply_text("Комментарий к заявке? Если комментария нет — напиши «-».")
+    prompt_msg = await update.message.reply_text("Комментарий к заявке? Если комментария нет — напиши «-».")
+    track_bot_message(context, prompt_msg)
     return COMMENT
 
 
@@ -765,11 +829,13 @@ async def publish_created_request_cards(update: Update, context: ContextTypes.DE
 
 
 async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    track_update_message(update, context)
     comment = (update.message.text or "").strip()
     if comment == "-":
         comment = ""
     context.user_data["comment"] = comment
     progress_msg = await update.message.reply_text("⏳ Отправляю заявку…")
+    track_bot_message(context, progress_msg)
 
     event = context.user_data.get("selected_event", {})
     payload = {
@@ -796,6 +862,7 @@ async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_T
             FLOW_CACHE.pop(flow_cache_key(update.effective_user.id), None)
         await publish_created_request_cards(update, context, request, progress_msg=progress_msg)
         await remove_progress_message(context, request.get("paymentId"))
+        await cleanup_payment_flow_messages(context, update.effective_chat.id)
         await update.message.reply_text("Готово. Заявка ушла админу и появилась на сайте.", reply_markup=MAIN_KEYBOARD)
 
     except requests.exceptions.Timeout:
@@ -809,6 +876,7 @@ async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_T
             except Exception as err:
                 print(f"publish recovered request error: {err}")
             await remove_progress_message(context, recovered.get("paymentId"))
+            await cleanup_payment_flow_messages(context, update.effective_chat.id)
             await update.message.reply_text("Готово. Заявка появилась на сайте. Повторно отправлять не нужно.", reply_markup=MAIN_KEYBOARD)
         else:
             await safe_edit_text(progress_msg, "⏳ Не получил подтверждение от Google, но заявка могла записаться.")
@@ -1177,6 +1245,8 @@ async def post_init(application):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
+        track_update_message(update, context)
+        await cleanup_payment_flow_messages(context, update.effective_chat.id)
         await update.message.reply_text("Действие отменено.", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
