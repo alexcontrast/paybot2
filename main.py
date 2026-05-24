@@ -54,7 +54,7 @@ POLL_SITE_REQUESTS_SECONDS = int(os.getenv("POLL_SITE_REQUESTS_SECONDS", "20"))
 ) = range(10)
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["Новая заявка"], ["Мои заявки", "Привязать аккаунт"]],
+    [["Новая заявка"], ["Мои заявки", "Привязать аккаунт"], ["Отменить"]],
     resize_keyboard=True,
     one_time_keyboard=False,
 )
@@ -1513,7 +1513,10 @@ def main():
             BIND_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_phone)],
             BIND_PIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_pin)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^Отменить$"), cancel),
+        ],
     )
 
     request_conversation = ConversationHandler(
@@ -1528,12 +1531,16 @@ def main():
             CARD_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_card_number)],
             COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_comment_and_submit)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^Отменить$"), cancel),
+        ],
     )
 
     app.add_handler(bind_conversation)
     app.add_handler(request_conversation)
     app.add_handler(MessageHandler(filters.Regex("^Мои заявки$"), my_requests))
+    app.add_handler(MessageHandler(filters.Regex("^Отменить$"), cancel))
     app.add_handler(CallbackQueryHandler(handle_admin_action, pattern="^admin:"))
     app.add_handler(CallbackQueryHandler(handle_manager_action, pattern="^manager:"))
     app.add_handler(CommandHandler("cancel", cancel))
