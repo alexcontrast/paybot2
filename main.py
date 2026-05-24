@@ -13,6 +13,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 import requests
+
+SESSION = requests.Session()
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -30,6 +32,7 @@ from telegram.ext import (
     filters,
 )
 
+# v161: speed layer — longer Railway cache, stale-while-revalidate, item prewarm, faster request endpoint.
 # v160: delete admin card too when a request is canceled/archived from the website; preserve all known Telegram message IDs.
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
@@ -59,9 +62,11 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 PAYMENT_METHODS = ["По счету", "На карту", "Нал"]
 EXTRA_ITEM_ORDER = -1
 FLOW_CACHE = {}
-FLOW_CACHE_TTL_SECONDS = 180
+FLOW_CACHE_TTL_SECONDS = 900
 ITEM_CACHE = {}
-ITEM_CACHE_TTL_SECONDS = 300
+ITEM_CACHE_TTL_SECONDS = 900
+FLOW_REFRESH_IN_PROGRESS = set()
+ITEM_REFRESH_IN_PROGRESS = set()
 FLOW_CLEANUP_KEY = "payment_flow_message_ids"
 
 
@@ -86,7 +91,7 @@ def api(action: str, data: Optional[Dict[str, Any]] = None, timeout: int = 120) 
         "action": action,
         "data": data or {},
     }
-    response = requests.post(APPS_SCRIPT_URL, json=payload, timeout=timeout)
+    response = SESSION.post(APPS_SCRIPT_URL, json=payload, timeout=timeout)
     response.raise_for_status()
     result = response.json()
     if not result.get("ok"):
@@ -133,14 +138,43 @@ def set_local_flow_cache(telegram_id: Any, data: Dict[str, Any]) -> None:
     FLOW_CACHE[key] = {'ts': time.time(), 'data': data or {}}
 
 
-async def load_flow_data(telegram_id: Any, prefer_cache: bool = True) -> Dict[str, Any]:
+async def _refresh_flow_cache_background(telegram_id: Any) -> None:
+    key = flow_cache_key(telegram_id)
+    if not key or key in FLOW_REFRESH_IN_PROGRESS:
+        return
+    FLOW_REFRESH_IN_PROGRESS.add(key)
+    try:
+        try:
+            result = await api_async('list_flow_fast', {'telegramId': telegram_id}, timeout=45)
+        except Exception as err:
+            err_text = str(err)
+            if 'list_flow_fast' not in err_text and 'Неизвестное действие' not in err_text:
+                raise
+            result = await api_async('list_flow', {'telegramId': telegram_id}, timeout=90)
+        set_local_flow_cache(telegram_id, result)
+    except Exception as err:
+        print(f"flow background refresh failed for {telegram_id}: {err}")
+    finally:
+        FLOW_REFRESH_IN_PROGRESS.discard(key)
+
+
+def schedule_flow_refresh(telegram_id: Any) -> None:
+    try:
+        asyncio.create_task(_refresh_flow_cache_background(telegram_id))
+    except RuntimeError:
+        pass
+
+
+async def load_flow_data(telegram_id: Any, prefer_cache: bool = True, refresh_if_cached: bool = True) -> Dict[str, Any]:
     if prefer_cache:
         cached = get_local_flow_cache(telegram_id)
         if cached:
+            if refresh_if_cached:
+                schedule_flow_refresh(telegram_id)
             return dict(cached, localCached=True)
 
     try:
-        result = await api_async('list_flow_fast', {'telegramId': telegram_id}, timeout=120)
+        result = await api_async('list_flow_fast', {'telegramId': telegram_id}, timeout=60)
     except Exception as err:
         # Если Apps Script ещё не обновлён/не redeploy и не знает новый endpoint,
         # откатываемся на старое действие, чтобы бот не падал у менеджера.
@@ -181,13 +215,56 @@ def clear_local_item_cache(telegram_id: Any, event_id: Any = None) -> None:
         if key.startswith(prefix):
             ITEM_CACHE.pop(key, None)
 
-async def load_items_data(telegram_id: Any, event_id: Any, prefer_cache: bool = True) -> Dict[str, Any]:
+async def _refresh_item_cache_background(telegram_id: Any, event_id: Any) -> None:
+    key = item_cache_key(telegram_id, event_id)
+    if not event_id or key in ITEM_REFRESH_IN_PROGRESS:
+        return
+    ITEM_REFRESH_IN_PROGRESS.add(key)
+    try:
+        try:
+            result = await api_async("list_items_ultra", {"telegramId": telegram_id, "eventId": event_id}, timeout=30)
+        except Exception as err:
+            err_text = str(err)
+            if 'list_items_ultra' not in err_text and 'Неизвестное действие' not in err_text:
+                raise
+            result = await api_async("list_items_fast", {"telegramId": telegram_id, "eventId": event_id}, timeout=60)
+        set_local_item_cache(telegram_id, event_id, result)
+    except Exception as err:
+        print(f"items background refresh failed for {telegram_id}/{event_id}: {err}")
+    finally:
+        ITEM_REFRESH_IN_PROGRESS.discard(key)
+
+
+def schedule_items_refresh(telegram_id: Any, event_id: Any) -> None:
+    try:
+        asyncio.create_task(_refresh_item_cache_background(telegram_id, event_id))
+    except RuntimeError:
+        pass
+
+
+async def prewarm_items_for_events(telegram_id: Any, events: List[Dict[str, Any]], limit: int = 6) -> None:
+    # Прогреваем позиции для ближайших карточек месяца в фоне. Это делает следующий клик почти мгновенным.
+    count = 0
+    for event in events or []:
+        event_id = event.get("eventId")
+        if not event_id or get_local_item_cache(telegram_id, event_id):
+            continue
+        count += 1
+        schedule_items_refresh(telegram_id, event_id)
+        if count >= limit:
+            break
+        await asyncio.sleep(0.08)
+
+
+async def load_items_data(telegram_id: Any, event_id: Any, prefer_cache: bool = True, refresh_if_cached: bool = True) -> Dict[str, Any]:
     if prefer_cache:
         cached = get_local_item_cache(telegram_id, event_id)
         if cached:
+            if refresh_if_cached:
+                schedule_items_refresh(telegram_id, event_id)
             return dict(cached, localCached=True)
     try:
-        result = await api_async("list_items_ultra", {"telegramId": telegram_id, "eventId": event_id}, timeout=45)
+        result = await api_async("list_items_ultra", {"telegramId": telegram_id, "eventId": event_id}, timeout=35)
     except Exception as err:
         err_text = str(err)
         if 'list_items_ultra' not in err_text and 'Неизвестное действие' not in err_text:
@@ -195,6 +272,7 @@ async def load_items_data(telegram_id: Any, event_id: Any, prefer_cache: bool = 
         result = await api_async("list_items_fast", {"telegramId": telegram_id, "eventId": event_id}, timeout=90)
     set_local_item_cache(telegram_id, event_id, result)
     return result
+
 
 
 async def mark_notified_retry(payment_id: Any, admin_message_id: Any = None, manager_message_id: Any = None) -> bool:
@@ -603,6 +681,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = await ensure_bound(update, context)
     if user:
+        schedule_flow_refresh(update.effective_user.id)
         await update.message.reply_text(
             f"Привет, {user.get('name')}! Можно создавать заявки.",
             reply_markup=MAIN_KEYBOARD,
@@ -663,6 +742,7 @@ async def bind_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "pin": update.message.text.strip(),
         })
         context.user_data["bound_user"] = result.get("user")
+        schedule_flow_refresh(tg_user.id)
         await safe_edit_text(progress_msg, "✅ Аккаунт привязан.")
         await update.message.reply_text("Готово, аккаунт привязан. Можно создавать заявки.", reply_markup=MAIN_KEYBOARD)
         return ConversationHandler.END
@@ -718,6 +798,8 @@ async def choose_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["selected_month"] = month
     events = (context.user_data.get("events_by_month") or {}).get(month, [])
     context.user_data["events"] = events
+    if events:
+        asyncio.create_task(prewarm_items_for_events(query.from_user.id, events, limit=8))
     if not events:
         await query.edit_message_text("В этом месяце мероприятий нет.")
         return ConversationHandler.END
@@ -975,16 +1057,16 @@ async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         try:
-            result = await api_async("create_request_instant", {"telegramId": update.effective_user.id, "payload": payload}, timeout=45)
+            result = await api_async("create_request_v161", {"telegramId": update.effective_user.id, "payload": payload}, timeout=35)
         except Exception as instant_err:
             err_text = str(instant_err)
-            if 'create_request_instant' not in err_text and 'Неизвестное действие' not in err_text:
+            if 'create_request_v161' not in err_text and 'Неизвестное действие' not in err_text:
                 raise
-            result = await api_async("create_request_fast", {"telegramId": update.effective_user.id, "payload": payload}, timeout=90)
+            result = await api_async("create_request_instant", {"telegramId": update.effective_user.id, "payload": payload}, timeout=60)
         request = result.get("request", {})
         if payload.get("itemOrder") == EXTRA_ITEM_ORDER:
             clear_local_item_cache(update.effective_user.id, payload.get("eventId"))
-            FLOW_CACHE.pop(flow_cache_key(update.effective_user.id), None)
+            schedule_flow_refresh(update.effective_user.id)
         await publish_created_request_cards(update, context, request, progress_msg=progress_msg)
         await remove_progress_message(context, request.get("paymentId"))
         await cleanup_payment_flow_messages(context, update.effective_chat.id)
