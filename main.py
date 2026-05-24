@@ -30,6 +30,7 @@ from telegram.ext import (
     filters,
 )
 
+# v157: cleanup final service text and robust admin-card deletion on manager cancel.
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL")
@@ -314,9 +315,22 @@ async def remove_progress_message(context: ContextTypes.DEFAULT_TYPE, payment_id
 async def remove_payment_messages_by_id(context: ContextTypes.DEFAULT_TYPE, payment_id: Any, manager_telegram_id: Any = None) -> None:
     key = str(payment_id or "")
     item = PAYMENT_MESSAGE_CACHE.pop(key, {})
-    await safe_delete_message(context, ADMIN_CHAT_ID, item.get("admin_message_id"))
-    manager_tg = manager_telegram_id or item.get("manager_telegram_id")
-    await safe_delete_message(context, manager_tg, item.get("manager_message_id"))
+
+    # v157: after Railway redeploys or slow create flows, the in-memory cache can be empty.
+    # Fetch message IDs from Apps Script so manager-cancel also removes the admin card.
+    request = None
+    try:
+        request = await fetch_payment_request(payment_id, timeout=20)
+    except Exception:
+        request = None
+
+    admin_id = item.get("admin_message_id") or (request or {}).get("telegramAdminMessageId")
+    manager_msg_id = item.get("manager_message_id") or (request or {}).get("telegramManagerMessageId")
+    manager_tg = manager_telegram_id or item.get("manager_telegram_id") or (request or {}).get("telegramId")
+
+    await safe_delete_message(context, ADMIN_CHAT_ID, admin_id)
+    if manager_tg and manager_msg_id:
+        await safe_delete_message(context, manager_tg, manager_msg_id)
     await remove_progress_message(context, payment_id)
 
 
@@ -886,7 +900,6 @@ async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_T
         await publish_created_request_cards(update, context, request, progress_msg=progress_msg)
         await remove_progress_message(context, request.get("paymentId"))
         await cleanup_payment_flow_messages(context, update.effective_chat.id)
-        await update.message.reply_text("Готово. Заявка ушла админу и появилась на сайте.", reply_markup=MAIN_KEYBOARD)
 
     except requests.exceptions.Timeout:
         # Важный кейс: Apps Script мог уже записать заявку, но не успел вернуть ответ Telegram-боту.
@@ -900,7 +913,6 @@ async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_T
                 print(f"publish recovered request error: {err}")
             await remove_progress_message(context, recovered.get("paymentId"))
             await cleanup_payment_flow_messages(context, update.effective_chat.id)
-            await update.message.reply_text("Готово. Заявка появилась на сайте. Повторно отправлять не нужно.", reply_markup=MAIN_KEYBOARD)
         else:
             await safe_edit_text(progress_msg, "⏳ Не получил подтверждение от Google, но заявка могла записаться.")
             await update.message.reply_text(
