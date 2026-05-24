@@ -678,21 +678,16 @@ async def ensure_bound(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Op
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
-        return
-    user = await ensure_bound(update, context)
-    if user:
-        schedule_flow_refresh(update.effective_user.id)
-        await update.message.reply_text(
-            f"Привет, {user.get('name')}! Можно создавать заявки.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
+        return ConversationHandler.END
+
+    # /start должен отвечать мгновенно и не ждать Apps Script.
+    # Проверку привязки делаем только при действиях «Новая заявка» / «Мои заявки»
+    # или при явном нажатии «Привязать аккаунт».
     await update.message.reply_text(
-        "Привет! Это тестовый бот заявок на оплату.\n\n"
-        "Сначала привяжем Telegram к аккаунту на сайте. Введи телефон в формате +7 (___) ___-__-__:",
-        reply_markup=ReplyKeyboardRemove(),
+        "Главное меню:",
+        reply_markup=MAIN_KEYBOARD,
     )
-    return BIND_PHONE
+    return ConversationHandler.END
 
 
 def normalize_kz_phone_for_bot(raw: str) -> Optional[str]:
@@ -759,7 +754,7 @@ async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     track_update_message(update, context)
     user = await ensure_bound(update, context)
     if not user:
-        await update.message.reply_text("Сначала привяжи аккаунт: /start")
+        await update.message.reply_text("Сначала привяжи аккаунт кнопкой «Привязать аккаунт».")
         return ConversationHandler.END
     try:
         status_msg = await update.message.reply_text("⏳ Загружаю мероприятия…")
@@ -1101,7 +1096,7 @@ async def my_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = await ensure_bound(update, context)
     if not user:
-        await update.message.reply_text("Сначала привяжи аккаунт: /start")
+        await update.message.reply_text("Сначала привяжи аккаунт кнопкой «Привязать аккаунт».")
         return
     progress_msg = await update.message.reply_text("⏳ Загружаю заявки…")
     try:
@@ -1514,6 +1509,7 @@ def main():
             BIND_PIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, bind_pin)],
         },
         fallbacks=[
+            CommandHandler("start", start),
             CommandHandler("cancel", cancel),
             MessageHandler(filters.Regex("^Отменить$"), cancel),
         ],
@@ -1532,6 +1528,7 @@ def main():
             COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_comment_and_submit)],
         },
         fallbacks=[
+            CommandHandler("start", start),
             CommandHandler("cancel", cancel),
             MessageHandler(filters.Regex("^Отменить$"), cancel),
         ],
