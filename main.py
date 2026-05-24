@@ -1,3 +1,5 @@
+RECENTLY_PUBLISHED_PAYMENT_IDS = {}
+RECENTLY_PUBLISHED_TTL_SECONDS = 10 * 60
 import os
 import re
 import html
@@ -633,7 +635,27 @@ async def recover_created_request_after_timeout(update: Update, context: Context
     return None
 
 
+
+def remember_recently_published(payment_id: Any) -> None:
+    if not payment_id:
+        return
+    RECENTLY_PUBLISHED_PAYMENT_IDS[str(payment_id)] = time.time()
+
+
+def is_recently_published(payment_id: Any) -> bool:
+    if not payment_id:
+        return False
+    now = time.time()
+    # Cheap cleanup.
+    for pid, ts in list(RECENTLY_PUBLISHED_PAYMENT_IDS.items()):
+        if now - ts > RECENTLY_PUBLISHED_TTL_SECONDS:
+            RECENTLY_PUBLISHED_PAYMENT_IDS.pop(pid, None)
+    ts = RECENTLY_PUBLISHED_PAYMENT_IDS.get(str(payment_id))
+    return bool(ts and now - ts <= RECENTLY_PUBLISHED_TTL_SECONDS)
+
+
 async def publish_created_request_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, request: Dict[str, Any], title: str = "🧾 Заявка создана") -> None:
+    remember_recently_published(request.get("paymentId"))
     manager_msg = await update.message.reply_html(
         payment_text(request, title),
         reply_markup=manager_keyboard(request.get("paymentId"), request.get("status")),
@@ -903,6 +925,8 @@ async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
         result = api("list_unnotified", {})
         for request in result.get("requests", []):
             payment_id = request.get("paymentId")
+            if is_recently_published(payment_id):
+                continue
             admin_msg = await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=payment_text(request, "🧾 Новая заявка с сайта"),
@@ -922,6 +946,7 @@ async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
                     manager_msg_id = manager_msg.message_id
                 except Exception:
                     manager_msg_id = ""
+            remember_recently_published(payment_id)
             await mark_notified_retry(
                 payment_id,
                 admin_message_id=admin_msg.message_id,
