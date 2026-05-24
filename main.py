@@ -454,9 +454,12 @@ async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("Выбери месяц мероприятия:", reply_markup=month_keyboard(months))
         return CHOOSE_MONTH
     except Exception as err:
-        await update.message.reply_text(f"Не удалось загрузить мероприятия: {err}
-
-Попробуй нажать «Новая заявка» ещё раз. Если кэш уже успел сохраниться, следующий заход откроется быстрее.", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text(
+            f"Не удалось загрузить мероприятия: {err}\n\n"
+            "Попробуй нажать «Новая заявка» ещё раз. Если кэш уже успел сохраниться, "
+            "следующий заход откроется быстрее.",
+            reply_markup=MAIN_KEYBOARD,
+        )
         return ConversationHandler.END
 
 
