@@ -1353,39 +1353,86 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
             manager_msg_id = request.get("telegramManagerMessageId")
             manager_tg = request.get("telegramId")
 
+            # v162: при смене статуса на сайте иногда обновлялась только карточка менеджера.
+            # Причина — админский message_id мог не прийти в list_status_updates или edit падал,
+            # а бот всё равно отмечал статус как синхронизированный. Теперь подтягиваем полную
+            # заявку, используем локальный кэш message_id и отмечаем sync только после успешной
+            # обработки админской карточки/удаления.
+            cached = PAYMENT_MESSAGE_CACHE.get(str(payment_id or ""), {})
+            full_request = None
+            try:
+                full_request = await fetch_payment_request(payment_id, timeout=20)
+            except Exception:
+                full_request = None
+            full_request = full_request or {}
+
+            admin_ids = unique_int_ids(
+                admin_msg_id,
+                request.get("telegramAdminMessageId"),
+                full_request.get("telegramAdminMessageId"),
+                cached.get("admin_message_id"),
+                cached.get("admin_message_ids"),
+            )
+            manager_ids = unique_int_ids(
+                manager_msg_id,
+                request.get("telegramManagerMessageId"),
+                full_request.get("telegramManagerMessageId"),
+                cached.get("manager_message_id"),
+                cached.get("manager_message_ids"),
+            )
+            manager_tg = manager_tg or full_request.get("telegramId") or cached.get("manager_telegram_id")
+
+            processed_ok = False
+
             if is_cashbox_archived(request):
                 await remove_archived_payment_messages(
                     context,
                     request,
-                    admin_message_id=admin_msg_id,
-                    manager_message_id=manager_msg_id,
+                    admin_message_id=admin_ids,
+                    manager_message_id=manager_ids,
                     manager_telegram_id=manager_tg,
                 )
+                processed_ok = True
             else:
-                remember_payment_messages(payment_id, admin_msg_id, manager_msg_id, manager_tg)
-                await edit_payment_message(
-                    context,
-                    ADMIN_CHAT_ID,
-                    admin_msg_id,
-                    request,
-                    "🧾 Заявка обновлена",
-                    is_admin=True,
-                )
+                remember_payment_messages(payment_id, admin_ids, manager_ids, manager_tg)
 
-                if manager_tg and manager_msg_id:
-                    await edit_payment_message(
+                admin_edited = False
+                for aid in admin_ids:
+                    edited = await edit_payment_message(
                         context,
-                        int(manager_tg),
-                        manager_msg_id,
+                        ADMIN_CHAT_ID,
+                        aid,
                         request,
-                        "🔔 Статус заявки обновлён",
-                        is_admin=False,
+                        "🧾 Заявка обновлена",
+                        is_admin=True,
                     )
+                    admin_edited = admin_edited or edited
 
-            try:
-                api("mark_status_synced", {"paymentId": payment_id, "status": request.get("status")})
-            except Exception:
-                pass
+                manager_edited = False
+                if manager_tg:
+                    for mid in manager_ids:
+                        edited = await edit_payment_message(
+                            context,
+                            int(manager_tg),
+                            mid,
+                            request,
+                            "🔔 Статус заявки обновлён",
+                            is_admin=False,
+                        )
+                        manager_edited = manager_edited or edited
+
+                # Если админская карточка известна, она должна обновиться. Иначе не помечаем
+                # статус синхронизированным, чтобы polling повторил попытку, а не оставил
+                # админа в прошлом статусе.
+                processed_ok = (not admin_ids or admin_edited) and (not manager_ids or manager_edited)
+
+            if processed_ok:
+                try:
+                    api("mark_status_synced", {"paymentId": payment_id, "status": request.get("status")})
+                except Exception:
+                    pass
+            else:
+                print(f"status sync not confirmed for {payment_id}: admin_ids={admin_ids}, manager_ids={manager_ids}")
     except Exception as err:
         print(f"poll_status_updates error: {err}")
 
