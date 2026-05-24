@@ -129,7 +129,17 @@ async def load_flow_data(telegram_id: Any, prefer_cache: bool = True) -> Dict[st
         cached = get_local_flow_cache(telegram_id)
         if cached:
             return dict(cached, localCached=True)
-    result = await api_async('list_flow_fast', {'telegramId': telegram_id}, timeout=120)
+
+    try:
+        result = await api_async('list_flow_fast', {'telegramId': telegram_id}, timeout=120)
+    except Exception as err:
+        # Если Apps Script ещё не обновлён/не redeploy и не знает новый endpoint,
+        # откатываемся на старое действие, чтобы бот не падал у менеджера.
+        err_text = str(err)
+        if 'list_flow_fast' not in err_text and 'Неизвестное действие' not in err_text:
+            raise
+        result = await api_async('list_flow', {'telegramId': telegram_id}, timeout=120)
+
     set_local_flow_cache(telegram_id, result)
     return result
 
@@ -463,6 +473,7 @@ async def new_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 
+
 async def choose_month(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Открываю месяц…")
@@ -577,42 +588,113 @@ async def get_card_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return COMMENT
 
 
+async def recover_created_request_after_timeout(update: Update, context: ContextTypes.DEFAULT_TYPE, payload: Dict[str, Any], attempts: int = 8) -> Optional[Dict[str, Any]]:
+    """После timeout у Apps Script заявка часто уже успевает записаться.
+    Не создаём дубль: несколько раз ищем свежую заявку менеджера по данным текущей формы.
+    """
+    event_id = str(payload.get("eventId") or "")
+    amount = int(payload.get("amount") or 0)
+    payment_method = str(payload.get("paymentType") or "")
+    item_order = int(payload.get("itemOrder") or 0)
+    new_position = str(payload.get("newPositionName") or "").strip().lower()
+
+    for _ in range(max(1, attempts)):
+        await asyncio.sleep(3)
+        try:
+            result = await api_async("list_my_requests", {"telegramId": update.effective_user.id}, timeout=45)
+            candidates = result.get("requests", []) or []
+            for req in candidates:
+                req_event = str(req.get("eventId") or "")
+                req_amount = int(float(req.get("requestAmount") or 0))
+                req_method = str(req.get("requestPaymentType") or "")
+                req_order = int(float(req.get("itemOrder") or req.get("itemOrderNumber") or 0))
+                req_pos = str(req.get("positionName") or "").strip().lower()
+                status = str(req.get("status") or "")
+
+                if req_event != event_id:
+                    continue
+                if req_amount != amount:
+                    continue
+                if payment_method and req_method != payment_method:
+                    continue
+                if status not in ["Новая", "Оплачено"]:
+                    continue
+
+                # Для обычной позиции сверяем номер. Для доппозиции (-1) после записи номер уже новый,
+                # поэтому сверяем название новой позиции, если оно есть.
+                if item_order != EXTRA_ITEM_ORDER and req_order != item_order:
+                    continue
+                if item_order == EXTRA_ITEM_ORDER and new_position and req_pos != new_position:
+                    continue
+                return req
+        except Exception as err:
+            print(f"recover_created_request_after_timeout error: {err}")
+            continue
+    return None
+
+
+async def publish_created_request_cards(update: Update, context: ContextTypes.DEFAULT_TYPE, request: Dict[str, Any], title: str = "🧾 Заявка создана") -> None:
+    manager_msg = await update.message.reply_html(
+        payment_text(request, title),
+        reply_markup=manager_keyboard(request.get("paymentId"), request.get("status")),
+    )
+    admin_msg = await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=payment_text(request, "🧾 Новая заявка на оплату"),
+        parse_mode="HTML",
+        reply_markup=admin_keyboard(request.get("paymentId"), request.get("status")),
+    )
+    await mark_notified_retry(
+        request.get("paymentId"),
+        admin_message_id=admin_msg.message_id,
+        manager_message_id=manager_msg.message_id,
+    )
+
+
 async def get_comment_and_submit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     comment = (update.message.text or "").strip()
     if comment == "-":
         comment = ""
     context.user_data["comment"] = comment
     progress_msg = await update.message.reply_text("⏳ Отправляю заявку…")
+
+    event = context.user_data.get("selected_event", {})
+    payload = {
+        "eventId": event.get("eventId"),
+        "itemOrder": context.user_data.get("item_order"),
+        "amount": context.user_data.get("amount"),
+        "paymentType": context.user_data.get("payment_method"),
+        "cardNumber": context.user_data.get("card_number", ""),
+        "comment": comment,
+        "newPositionName": context.user_data.get("new_position_name", ""),
+    }
+
     try:
-        event = context.user_data.get("selected_event", {})
-        payload = {
-            "eventId": event.get("eventId"),
-            "itemOrder": context.user_data.get("item_order"),
-            "amount": context.user_data.get("amount"),
-            "paymentType": context.user_data.get("payment_method"),
-            "cardNumber": context.user_data.get("card_number", ""),
-            "comment": comment,
-            "newPositionName": context.user_data.get("new_position_name", ""),
-        }
-        result = api("create_request_fast", {"telegramId": update.effective_user.id, "payload": payload})
+        result = await api_async("create_request_fast", {"telegramId": update.effective_user.id, "payload": payload}, timeout=120)
         request = result.get("request", {})
-        manager_msg = await update.message.reply_html(
-            payment_text(request, "🧾 Заявка создана"),
-            reply_markup=manager_keyboard(request.get("paymentId"), request.get("status")),
-        )
-        admin_msg = await context.bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=payment_text(request, "🧾 Новая заявка на оплату"),
-            parse_mode="HTML",
-            reply_markup=admin_keyboard(request.get("paymentId"), request.get("status")),
-        )
-        await mark_notified_retry(
-            request.get("paymentId"),
-            admin_message_id=admin_msg.message_id,
-            manager_message_id=manager_msg.message_id,
-        )
+        await publish_created_request_cards(update, context, request)
         await safe_edit_text(progress_msg, "✅ Заявка записана.")
         await update.message.reply_text("Готово. Заявка ушла админу и появилась на сайте.", reply_markup=MAIN_KEYBOARD)
+
+    except requests.exceptions.Timeout:
+        # Важный кейс: Apps Script мог уже записать заявку, но не успел вернуть ответ Telegram-боту.
+        # Не пугаем менеджера ошибкой и не предлагаем отправлять дубль.
+        await safe_edit_text(progress_msg, "⏳ Google долго отвечает. Проверяю, записалась ли заявка…")
+        recovered = await recover_created_request_after_timeout(update, context, payload)
+        if recovered:
+            try:
+                await publish_created_request_cards(update, context, recovered, "🧾 Заявка создана")
+            except Exception as err:
+                print(f"publish recovered request error: {err}")
+            await safe_edit_text(progress_msg, "✅ Заявка записана.")
+            await update.message.reply_text("Готово. Заявка появилась на сайте. Повторно отправлять не нужно.", reply_markup=MAIN_KEYBOARD)
+        else:
+            await safe_edit_text(progress_msg, "⏳ Не получил подтверждение от Google, но заявка могла записаться.")
+            await update.message.reply_text(
+                "Не отправляй повторно прямо сейчас. Открой «Мои заявки» через минуту: если заявка там есть, значит всё прошло.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+
     except Exception as err:
         await safe_edit_text(progress_msg, "⚠️ Не удалось отправить заявку.")
         await update.message.reply_text(f"Не удалось отправить заявку: {err}", reply_markup=MAIN_KEYBOARD)
