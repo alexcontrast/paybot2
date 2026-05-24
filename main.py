@@ -846,66 +846,157 @@ async def my_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Не удалось загрузить заявки: {err}")
 
 
+async def fetch_payment_request(payment_id: Any, timeout: int = 25) -> Optional[Dict[str, Any]]:
+    try:
+        result = await api_async("get_request", {"paymentId": payment_id}, timeout=timeout)
+        return result.get("request") or None
+    except Exception as err:
+        print(f"fetch_payment_request failed for {payment_id}: {err}")
+        return None
+
+
+def admin_status_reached(expected_status: str, actual_status: str) -> bool:
+    actual = str(actual_status or "")
+    expected = str(expected_status or "")
+    if expected == "Оплачено":
+        return actual in ["Оплачено", "Деньги в кассе"]
+    if expected == "Деньги в кассе":
+        return actual == "Деньги в кассе"
+    if expected == "Отклонено":
+        return actual == "Отклонено"
+    return actual == expected
+
+
+async def set_manager_status_processing(context: ContextTypes.DEFAULT_TYPE, request: Optional[Dict[str, Any]]) -> None:
+    if not request:
+        return
+    manager_tg = request.get("telegramId")
+    manager_msg_id = request.get("telegramManagerMessageId")
+    payment_id = request.get("paymentId")
+    if not manager_tg or not manager_msg_id:
+        return
+    remember_payment_messages(payment_id, request.get("telegramAdminMessageId"), manager_msg_id, manager_tg)
+    try:
+        await context.bot.edit_message_text(
+            chat_id=int(manager_tg),
+            message_id=int(manager_msg_id),
+            text=payment_text(request, "⏳ Обновляю статус заявки") + "\n\n⏳ Обновляю статус…",
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+    except Exception as err:
+        print(f"set_manager_status_processing failed for {payment_id}: {err}")
+
+
+async def recover_admin_update_after_timeout(payment_id: Any, expected_status: str, attempts: int = 8) -> Optional[Dict[str, Any]]:
+    for _ in range(max(1, attempts)):
+        await asyncio.sleep(3)
+        request = await fetch_payment_request(payment_id, timeout=30)
+        if request and admin_status_reached(expected_status, request.get("status")):
+            return request
+    return None
+
+
+async def apply_admin_status_result(
+    context: ContextTypes.DEFAULT_TYPE,
+    admin_message,
+    payment_id: Any,
+    request: Dict[str, Any],
+    processed_status: Optional[str] = None,
+) -> None:
+    request = request or {}
+    remember_payment_messages(
+        payment_id,
+        request.get("telegramAdminMessageId") or getattr(admin_message, "message_id", None),
+        request.get("telegramManagerMessageId"),
+        request.get("telegramId"),
+    )
+
+    # Финально закрытые заявки убираем из Telegram-чата: на сайте они уже в архиве.
+    if is_cashbox_archived(request):
+        await remove_archived_payment_messages(
+            context,
+            request,
+            admin_message_id=getattr(admin_message, "message_id", None),
+            manager_message_id=request.get("telegramManagerMessageId"),
+            manager_telegram_id=request.get("telegramId"),
+        )
+    else:
+        try:
+            await admin_message.edit_text(
+                payment_text(request, "🧾 Заявка обновлена"),
+                parse_mode="HTML",
+                reply_markup=admin_keyboard(payment_id, request.get("status")),
+            )
+        except Exception:
+            pass
+
+        manager_tg = request.get("telegramId")
+        manager_msg_id = request.get("telegramManagerMessageId")
+        if manager_tg and manager_msg_id:
+            edited = await edit_payment_message(
+                context,
+                int(manager_tg),
+                manager_msg_id,
+                request,
+                "🔔 Статус заявки обновлён",
+                is_admin=False,
+            )
+            if not edited:
+                await context.bot.send_message(
+                    chat_id=int(manager_tg),
+                    text=payment_text(request, "🔔 Статус заявки обновлён"),
+                    parse_mode="HTML",
+                )
+        elif manager_tg:
+            await context.bot.send_message(
+                chat_id=int(manager_tg),
+                text=payment_text(request, "🔔 Статус заявки обновлён"),
+                parse_mode="HTML",
+            )
+
+    try:
+        api("mark_status_synced", {"paymentId": payment_id, "status": processed_status or request.get("status")})
+    except Exception:
+        pass
+
+
 async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Обновляю статус…")
     if query.from_user.id != ADMIN_CHAT_ID:
         await query.answer("Эта кнопка только для админа.", show_alert=True)
         return
+
     _, action, payment_id = query.data.split(":", 2)
     status = {"paid": "Оплачено", "reject": "Отклонено", "cashin": "Деньги в кассе"}[action]
     old_text = query.message.text_html or query.message.text or ""
+
+    # Сначала снимаем кнопки у админа и у менеджера, чтобы никто не нажал второе действие,
+    # пока Apps Script меняет статус в Google Sheets.
     await safe_edit_text(query.message, old_text + "\n\n⏳ Обновляю статус…", parse_mode="HTML")
+    request_before = await fetch_payment_request(payment_id, timeout=20)
+    await set_manager_status_processing(context, request_before)
+
     try:
-        result = api("admin_update", {"paymentId": payment_id, "status": status, "comment": "Telegram"})
+        result = await api_async("admin_update", {"paymentId": payment_id, "status": status, "comment": "Telegram"}, timeout=120)
         request = result.get("request", {})
-
-        # Финально закрытые заявки убираем из Telegram-чата: на сайте они уже в архиве.
-        if is_cashbox_archived(request):
-            await remove_archived_payment_messages(
-                context,
-                request,
-                admin_message_id=query.message.message_id,
-                manager_message_id=request.get("telegramManagerMessageId"),
-                manager_telegram_id=request.get("telegramId"),
-            )
-        else:
-            await query.edit_message_text(
-                payment_text(request, "🧾 Заявка обновлена"),
-                parse_mode="HTML",
-                reply_markup=admin_keyboard(payment_id, request.get("status")),
-            )
-            manager_tg = request.get("telegramId")
-            manager_msg_id = request.get("telegramManagerMessageId")
-            if manager_tg and manager_msg_id:
-                edited = await edit_payment_message(
-                    context,
-                    int(manager_tg),
-                    manager_msg_id,
-                    request,
-                    "🔔 Статус заявки обновлён",
-                    is_admin=False,
-                )
-                if not edited:
-                    await context.bot.send_message(
-                        chat_id=int(manager_tg),
-                        text=payment_text(request, "🔔 Статус заявки обновлён"),
-                        parse_mode="HTML",
-                    )
-            elif manager_tg:
-                await context.bot.send_message(
-                    chat_id=int(manager_tg),
-                    text=payment_text(request, "🔔 Статус заявки обновлён"),
-                    parse_mode="HTML",
-                )
-        try:
-            api("mark_status_synced", {"paymentId": payment_id, "status": request.get("status")})
-        except Exception:
-            pass
+        await apply_admin_status_result(context, query.message, payment_id, request, processed_status=request.get("status"))
     except Exception as err:
-        await safe_edit_text(query.message, old_text + f"\n\n⚠️ Не удалось обновить статус: {esc(err)}", parse_mode="HTML")
-        await query.answer(str(err), show_alert=True)
+        # Apps Script часто успевает записать статус, но не успевает ответить боту.
+        # Поэтому сначала проверяем факт изменения, и только потом показываем ошибку.
+        recovered_request = await recover_admin_update_after_timeout(payment_id, status)
+        if recovered_request:
+            await apply_admin_status_result(context, query.message, payment_id, recovered_request, processed_status=status)
+            return
 
+        # Если статус не изменился, возвращаем исходную карточку и кнопку, чтобы админ мог повторить.
+        rollback_request = await fetch_payment_request(payment_id, timeout=20)
+        if rollback_request:
+            await apply_admin_status_result(context, query.message, payment_id, rollback_request, processed_status=rollback_request.get("status"))
+        else:
+            await safe_edit_text(query.message, old_text + f"\n\n⚠️ Не удалось обновить статус: {esc(err)}", parse_mode="HTML")
+        await query.answer(str(err), show_alert=True)
 
 
 async def recover_cancel_after_timeout(telegram_id: Any, payment_id: Any, attempts: int = 6) -> bool:
