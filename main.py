@@ -37,6 +37,9 @@ from telegram.ext import (
 # v160: delete admin card too when a request is canceled/archived from the website; preserve all known Telegram message IDs.
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+# v182: заявки "По счету" дублируются Татьяне как view-only копия.
+# Можно переопределить через Railway env TATYANA_CHAT_ID, но по умолчанию используем рабочий ID.
+TATYANA_CHAT_ID = int(os.getenv("TATYANA_CHAT_ID", "1896781134"))
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL")
 BOT_API_SECRET = os.getenv("BOT_API_SECRET")
 POLL_SITE_REQUESTS_SECONDS = int(os.getenv("POLL_SITE_REQUESTS_SECONDS", "20"))
@@ -288,23 +291,42 @@ async def load_items_data(telegram_id: Any, event_id: Any, prefer_cache: bool = 
 
 
 
-async def mark_notified_retry(payment_id: Any, admin_message_id: Any = None, manager_message_id: Any = None) -> bool:
+async def mark_notified_retry(payment_id: Any, admin_message_id: Any = None, manager_message_id: Any = None, tatyana_message_id: Any = None) -> bool:
     if not payment_id:
         return False
+    payload = {"paymentId": payment_id}
+    if admin_message_id is not None:
+        payload["adminMessageId"] = admin_message_id or ""
+    if manager_message_id is not None:
+        payload["managerMessageId"] = manager_message_id or ""
+    if tatyana_message_id is not None:
+        payload["tatyanaMessageId"] = tatyana_message_id or ""
     try:
         await api_retry(
             "mark_notified",
-            {
-                "paymentId": payment_id,
-                "adminMessageId": admin_message_id or "",
-                "managerMessageId": manager_message_id or "",
-            },
+            payload,
             attempts=4,
             delay=2.5,
         )
         return True
     except Exception as err:
         print(f"mark_notified failed for {payment_id}: {err}")
+        return False
+
+
+async def mark_tatyana_notified_retry(payment_id: Any, tatyana_message_id: Any) -> bool:
+    if not payment_id or not tatyana_message_id:
+        return False
+    try:
+        await api_retry(
+            "mark_tatyana_notified",
+            {"paymentId": payment_id, "tatyanaMessageId": tatyana_message_id},
+            attempts=3,
+            delay=2.0,
+        )
+        return True
+    except Exception as err:
+        print(f"mark_tatyana_notified failed for {payment_id}: {err}")
         return False
 
 
@@ -377,7 +399,7 @@ def is_cashbox_archived(request: Dict[str, Any]) -> bool:
     return (request.get("status") or "") in ["Деньги в кассе", "Отменено", "Отклонено"]
 
 
-def remember_payment_messages(payment_id: Any, admin_message_id: Any = None, manager_message_id: Any = None, manager_telegram_id: Any = None) -> None:
+def remember_payment_messages(payment_id: Any, admin_message_id: Any = None, manager_message_id: Any = None, manager_telegram_id: Any = None, tatyana_message_id: Any = None) -> None:
     if not payment_id:
         return
     key = str(payment_id)
@@ -386,26 +408,29 @@ def remember_payment_messages(payment_id: Any, admin_message_id: Any = None, man
     # v160: keep not only the last message_id, but the full known history.
     # If a request was accidentally sent twice earlier, cancellation/archiving must
     # remove every known admin/manager card, not just the latest one.
-    if admin_message_id:
-        item["admin_message_id"] = admin_message_id
-        ids = item.setdefault("admin_message_ids", [])
-        try:
-            admin_int = int(admin_message_id)
-            if admin_int not in ids:
-                ids.append(admin_int)
-        except Exception:
-            pass
-    if manager_message_id:
-        item["manager_message_id"] = manager_message_id
-        ids = item.setdefault("manager_message_ids", [])
-        try:
-            manager_int = int(manager_message_id)
-            if manager_int not in ids:
-                ids.append(manager_int)
-        except Exception:
-            pass
+    def add_message_ids(field: str, list_field: str, value: Any) -> None:
+        if not value:
+            return
+        ids = item.setdefault(list_field, [])
+        added = []
+        iterable = value if isinstance(value, (list, tuple, set)) else [value]
+        for raw in iterable:
+            try:
+                message_int = int(raw)
+            except Exception:
+                continue
+            if message_int and message_int not in ids:
+                ids.append(message_int)
+            if message_int:
+                added.append(message_int)
+        if added:
+            item[field] = added[-1]
+
+    add_message_ids("admin_message_id", "admin_message_ids", admin_message_id)
+    add_message_ids("manager_message_id", "manager_message_ids", manager_message_id)
     if manager_telegram_id:
         item["manager_telegram_id"] = manager_telegram_id
+    add_message_ids("tatyana_message_id", "tatyana_message_ids", tatyana_message_id)
     item["updated_at"] = time.time()
     PAYMENT_MESSAGE_CACHE[key] = item
 
@@ -460,7 +485,15 @@ async def remove_payment_messages_by_id(context: ContextTypes.DEFAULT_TYPE, paym
         item.get("manager_message_id"),
         (request or {}).get("telegramManagerMessageId"),
     )
+    tatyana_ids = unique_int_ids(
+        item.get("tatyana_message_ids"),
+        item.get("tatyana_message_id"),
+        (request or {}).get("telegramTatyanaMessageId"),
+    )
     manager_tg = manager_telegram_id or item.get("manager_telegram_id") or (request or {}).get("telegramId")
+
+    if request and should_notify_tatyana(request):
+        await sync_tatyana_payment_message(context, request, "🧾 Заявка по счету обновлена", tatyana_ids)
 
     for admin_id in admin_ids:
         await safe_delete_message(context, ADMIN_CHAT_ID, admin_id)
@@ -476,7 +509,7 @@ async def remove_archived_payment_messages(
     admin_message_id: Any = None,
     manager_message_id: Any = None,
     manager_telegram_id: Any = None,
-) -> None:
+) -> bool:
     payment_id = request.get("paymentId")
     cached = PAYMENT_MESSAGE_CACHE.pop(str(payment_id or ""), {})
 
@@ -504,7 +537,20 @@ async def remove_archived_payment_messages(
         cached.get("manager_message_id"),
         cached.get("manager_message_ids"),
     )
+    tatyana_ids = unique_int_ids(
+        request.get("telegramTatyanaMessageId"),
+        full_request.get("telegramTatyanaMessageId"),
+        cached.get("tatyana_message_id"),
+        cached.get("tatyana_message_ids"),
+    )
     manager_tg = manager_telegram_id or request.get("telegramId") or full_request.get("telegramId") or cached.get("manager_telegram_id")
+
+    effective_request = dict(full_request or {})
+    effective_request.update({k: v for k, v in (request or {}).items() if v not in (None, "")})
+    tatyana_ok = True
+    if should_notify_tatyana(effective_request):
+        tatyana_ids_after = await sync_tatyana_payment_message(context, effective_request, "🧾 Заявка по счету обновлена", tatyana_ids)
+        tatyana_ok = bool(tatyana_ids_after)
 
     for admin_id in admin_ids:
         await safe_delete_message(context, ADMIN_CHAT_ID, admin_id)
@@ -512,6 +558,7 @@ async def remove_archived_payment_messages(
         for manager_msg_id in manager_ids:
             await safe_delete_message(context, manager_tg, manager_msg_id)
     await remove_progress_message(context, payment_id)
+    return tatyana_ok
 
 
 async def show_processing_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
@@ -673,6 +720,81 @@ def payment_text(request: Dict[str, Any], title: str = "🧾 Заявка на �
         f"Статус оплаты: <b>{esc(payment_status)}</b>"
         f"{money_line}"
     )
+
+def is_invoice_payment_request(request: Dict[str, Any]) -> bool:
+    method = str((request or {}).get("requestPaymentType") or (request or {}).get("paymentType") or "").strip().lower()
+    return "счет" in method or "счёт" in method
+
+
+def should_notify_tatyana(request: Dict[str, Any]) -> bool:
+    return bool(TATYANA_CHAT_ID and is_invoice_payment_request(request or {}))
+
+
+async def edit_tatyana_payment_message(context: ContextTypes.DEFAULT_TYPE, message_id: Any, request: Dict[str, Any], title: str = "🧾 Заявка по счету обновлена") -> bool:
+    if not TATYANA_CHAT_ID or not message_id:
+        return False
+    try:
+        await context.bot.edit_message_text(
+            chat_id=TATYANA_CHAT_ID,
+            message_id=int(message_id),
+            text=payment_text(request, title),
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+        return True
+    except Exception as err:
+        print(f"tatyana edit failed for {request.get('paymentId')}: {err}")
+        return False
+
+
+async def sync_tatyana_payment_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    request: Dict[str, Any],
+    title: str = "🧾 Заявка по счету обновлена",
+    known_message_ids: Optional[List[Any]] = None,
+) -> List[int]:
+    """Create/update Tatiana's view-only copy for invoice requests.
+
+    Unlike manager/admin cards, Tatiana's card is never deleted when the request
+    reaches "Деньги в кассе"; it is updated to the final status and remains in history.
+    """
+    request = request or {}
+    payment_id = request.get("paymentId")
+    if not should_notify_tatyana(request):
+        return []
+
+    cached = PAYMENT_MESSAGE_CACHE.get(str(payment_id or ""), {})
+    ids = unique_int_ids(
+        known_message_ids,
+        request.get("telegramTatyanaMessageId"),
+        cached.get("tatyana_message_id"),
+        cached.get("tatyana_message_ids"),
+    )
+
+    edited_ids: List[int] = []
+    for message_id in ids:
+        if await edit_tatyana_payment_message(context, message_id, request, title):
+            edited_ids.append(int(message_id))
+
+    if edited_ids:
+        for message_id in edited_ids:
+            remember_payment_messages(payment_id, tatyana_message_id=message_id)
+            await mark_tatyana_notified_retry(payment_id, message_id)
+        return edited_ids
+
+    try:
+        msg = await context.bot.send_message(
+            chat_id=TATYANA_CHAT_ID,
+            text=payment_text(request, title),
+            parse_mode="HTML",
+            reply_markup=None,
+        )
+        remember_payment_messages(payment_id, tatyana_message_id=msg.message_id)
+        await mark_tatyana_notified_retry(payment_id, msg.message_id)
+        return [int(msg.message_id)]
+    except Exception as err:
+        print(f"tatyana send failed for {payment_id}: {err}")
+        return []
 
 
 def get_cached_bound_user(telegram_id: Any, context: Optional[ContextTypes.DEFAULT_TYPE] = None) -> Optional[Dict[str, Any]]:
@@ -1089,7 +1211,12 @@ async def publish_created_request_cards(update: Update, context: ContextTypes.DE
         reply_markup=admin_keyboard(payment_id, request.get("status")),
     )
 
-    remember_payment_messages(payment_id, admin_msg.message_id, manager_msg.message_id, update.effective_user.id)
+    tatyana_msg_id = ""
+    if should_notify_tatyana(request):
+        tatyana_ids = await sync_tatyana_payment_message(context, request, "🧾 Новая заявка по счету")
+        tatyana_msg_id = tatyana_ids[0] if tatyana_ids else ""
+
+    remember_payment_messages(payment_id, admin_msg.message_id, manager_msg.message_id, update.effective_user.id, tatyana_msg_id)
     if progress_msg:
         remember_progress_message(payment_id, update.effective_chat.id, progress_msg.message_id)
 
@@ -1116,6 +1243,7 @@ async def publish_created_request_cards(update: Update, context: ContextTypes.DE
                 payment_id,
                 admin_message_id=admin_msg.message_id,
                 manager_message_id=manager_msg.message_id,
+                tatyana_message_id=tatyana_msg_id,
             )
         except Exception as err:
             print(f"mark_notified background failed for {payment_id}: {err}")
@@ -1276,6 +1404,7 @@ async def apply_admin_status_result(
         request.get("telegramAdminMessageId") or getattr(admin_message, "message_id", None),
         request.get("telegramManagerMessageId"),
         request.get("telegramId"),
+        request.get("telegramTatyanaMessageId"),
     )
 
     # Финально закрытые заявки убираем из Telegram-чата: на сайте они уже в архиве.
@@ -1320,6 +1449,13 @@ async def apply_admin_status_result(
                 text=payment_text(request, "🔔 Статус заявки обновлён"),
                 parse_mode="HTML",
             )
+
+        await sync_tatyana_payment_message(
+            context,
+            request,
+            "🧾 Заявка по счету обновлена",
+            unique_int_ids(request.get("telegramTatyanaMessageId")),
+        )
 
     try:
         api("mark_status_synced", {"paymentId": payment_id, "status": processed_status or request.get("status")})
@@ -1444,6 +1580,7 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
             payment_id = request.get("paymentId")
             admin_msg_id = request.get("telegramAdminMessageId")
             manager_msg_id = request.get("telegramManagerMessageId")
+            tatyana_msg_id = request.get("telegramTatyanaMessageId")
             manager_tg = request.get("telegramId")
 
             # v162: при смене статуса на сайте иногда обновлялась только карточка менеджера.
@@ -1458,6 +1595,7 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 full_request = None
             full_request = full_request or {}
+            request = dict(full_request or {}, **{k: v for k, v in (request or {}).items() if v not in (None, "")})
 
             admin_ids = unique_int_ids(
                 admin_msg_id,
@@ -1473,21 +1611,27 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
                 cached.get("manager_message_id"),
                 cached.get("manager_message_ids"),
             )
+            tatyana_ids = unique_int_ids(
+                tatyana_msg_id,
+                request.get("telegramTatyanaMessageId"),
+                full_request.get("telegramTatyanaMessageId"),
+                cached.get("tatyana_message_id"),
+                cached.get("tatyana_message_ids"),
+            )
             manager_tg = manager_tg or full_request.get("telegramId") or cached.get("manager_telegram_id")
 
             processed_ok = False
 
             if is_cashbox_archived(request):
-                await remove_archived_payment_messages(
+                processed_ok = bool(await remove_archived_payment_messages(
                     context,
                     request,
                     admin_message_id=admin_ids,
                     manager_message_id=manager_ids,
                     manager_telegram_id=manager_tg,
-                )
-                processed_ok = True
+                ))
             else:
-                remember_payment_messages(payment_id, admin_ids, manager_ids, manager_tg)
+                remember_payment_messages(payment_id, admin_ids, manager_ids, manager_tg, tatyana_ids)
 
                 admin_edited = False
                 for aid in admin_ids:
@@ -1514,10 +1658,19 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
                         )
                         manager_edited = manager_edited or edited
 
+                tatyana_ids_after = await sync_tatyana_payment_message(
+                    context,
+                    request,
+                    "🧾 Заявка по счету обновлена",
+                    tatyana_ids,
+                )
+                tatyana_ok = (not should_notify_tatyana(request)) or bool(tatyana_ids_after)
+
                 # Если админская карточка известна, она должна обновиться. Иначе не помечаем
                 # статус синхронизированным, чтобы polling повторил попытку, а не оставил
-                # админа в прошлом статусе.
-                processed_ok = (not admin_ids or admin_edited) and (not manager_ids or manager_edited)
+                # админа в прошлом статусе. Татьянина view-only копия для "По счету" тоже
+                # должна обновиться или создаться, иначе polling повторит попытку.
+                processed_ok = (not admin_ids or admin_edited) and (not manager_ids or manager_edited) and tatyana_ok
 
             if processed_ok:
                 try:
@@ -1555,12 +1708,18 @@ async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
                     manager_msg_id = manager_msg.message_id
                 except Exception:
                     manager_msg_id = ""
+            tatyana_msg_id = ""
+            if should_notify_tatyana(request):
+                tatyana_ids = await sync_tatyana_payment_message(context, request, "🧾 Новая заявка по счету")
+                tatyana_msg_id = tatyana_ids[0] if tatyana_ids else ""
+
             remember_recently_published(payment_id)
-            remember_payment_messages(payment_id, admin_msg.message_id, manager_msg_id, manager_tg)
+            remember_payment_messages(payment_id, admin_msg.message_id, manager_msg_id, manager_tg, tatyana_msg_id)
             await mark_notified_retry(
                 payment_id,
                 admin_message_id=admin_msg.message_id,
                 manager_message_id=manager_msg_id,
+                tatyana_message_id=tatyana_msg_id,
             )
     except Exception as err:
         print(f"poll_site_requests error: {err}")
