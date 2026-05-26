@@ -43,6 +43,7 @@ TATYANA_CHAT_ID = int(os.getenv("TATYANA_CHAT_ID", "1896781134"))
 APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL")
 BOT_API_SECRET = os.getenv("BOT_API_SECRET")
 POLL_SITE_REQUESTS_SECONDS = int(os.getenv("POLL_SITE_REQUESTS_SECONDS", "20"))
+BOT_POLL_BATCH_LIMIT = int(os.getenv("BOT_POLL_BATCH_LIMIT", "5"))
 
 (
     BIND_PHONE,
@@ -130,6 +131,21 @@ async def api_retry(action: str, data: Optional[Dict[str, Any]] = None, attempts
 async def api_async(action: str, data: Optional[Dict[str, Any]] = None, timeout: int = 120) -> Dict[str, Any]:
     # requests блокирующий; уносим его в отдельный поток, чтобы бот не замирал целиком.
     return await asyncio.to_thread(api, action, data, timeout)
+
+
+async def api_async_try(actions, data: Optional[Dict[str, Any]] = None, timeout: int = 120) -> Dict[str, Any]:
+    """Try a list of Apps Script actions in order. Useful during staged deploys."""
+    last_error = None
+    for action in actions:
+        try:
+            return await api_async(action, data, timeout=timeout)
+        except Exception as err:
+            last_error = err
+            text = str(err)
+            if "Неизвестное действие" not in text and "Unknown" not in text and action != actions[-1]:
+                # For real server errors, still allow fallback only if this was a new optional action.
+                continue
+    raise last_error
 
 
 def flow_cache_key(telegram_id: Any) -> str:
@@ -513,14 +529,15 @@ async def remove_archived_payment_messages(
     payment_id = request.get("paymentId")
     cached = PAYMENT_MESSAGE_CACHE.pop(str(payment_id or ""), {})
 
-    # v160: for status changes made on the website, list_status_updates can return
-    # only part of Telegram metadata if old rows were created during a timeout.
-    # Pull the full request once more before deleting, then delete every known card.
+    # v207: for direct bot/admin actions the request already contains message IDs.
+    # Fetching full request here made "Деньги в кассе" feel frozen during high load.
+    # For website/status polling we still fetch only if essential IDs are missing.
     full_request = None
-    try:
-        full_request = await fetch_payment_request(payment_id, timeout=20)
-    except Exception:
-        full_request = None
+    if not (request.get("telegramAdminMessageId") or admin_message_id) and not (request.get("telegramManagerMessageId") or manager_message_id):
+        try:
+            full_request = await fetch_payment_request(payment_id, timeout=12)
+        except Exception:
+            full_request = None
     full_request = full_request or {}
 
     admin_ids = unique_int_ids(
@@ -1457,9 +1474,15 @@ async def apply_admin_status_result(
             unique_int_ids(request.get("telegramTatyanaMessageId")),
         )
 
+    async def _mark_status_synced_background():
+        try:
+            await api_async("mark_status_synced", {"paymentId": payment_id, "status": processed_status or request.get("status")}, timeout=30)
+        except Exception as err:
+            print(f"mark_status_synced background failed for {payment_id}: {err}")
+
     try:
-        api("mark_status_synced", {"paymentId": payment_id, "status": processed_status or request.get("status")})
-    except Exception:
+        asyncio.create_task(_mark_status_synced_background())
+    except RuntimeError:
         pass
 
 
@@ -1474,25 +1497,26 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     status = {"paid": "Оплачено", "reject": "Отклонено", "cashin": "Деньги в кассе"}[action]
     old_text = query.message.text_html or query.message.text or ""
 
-    # Сначала снимаем кнопки у админа и у менеджера, чтобы никто не нажал второе действие,
-    # пока Apps Script меняет статус в Google Sheets.
-    await safe_edit_text(query.message, old_text + "\n\n⏳ Обновляю статус…", parse_mode="HTML")
-    request_before = await fetch_payment_request(payment_id, timeout=20)
-    await set_manager_status_processing(context, request_before)
+    # v207: не делаем предварительный get_request перед сменой статуса.
+    # При большом потоке заявок этот лишний запрос блокировал кнопку админа на 20+ секунд.
+    await safe_edit_text(query.message, old_text + "\n\n⏳ Записываю статус…", parse_mode="HTML")
 
     try:
-        result = await api_async("admin_update", {"paymentId": payment_id, "status": status, "comment": "Telegram"}, timeout=120)
+        result = await api_async_try(
+            ["admin_update_fast", "admin_update"],
+            {"paymentId": payment_id, "status": status, "comment": "Telegram"},
+            timeout=45,
+        )
         request = result.get("request", {})
-        await apply_admin_status_result(context, query.message, payment_id, request, processed_status=request.get("status"))
+        await apply_admin_status_result(context, query.message, payment_id, request, processed_status=request.get("status") or status)
     except Exception as err:
-        # Apps Script часто успевает записать статус, но не успевает ответить боту.
-        # Поэтому сначала проверяем факт изменения, и только потом показываем ошибку.
-        recovered_request = await recover_admin_update_after_timeout(payment_id, status)
+        # Apps Script мог успеть записать статус, но не успеть вернуть ответ.
+        # Проверяем факт изменения, но не держим кнопку в вечном "ничего не происходит".
+        recovered_request = await recover_admin_update_after_timeout(payment_id, status, attempts=3)
         if recovered_request:
             await apply_admin_status_result(context, query.message, payment_id, recovered_request, processed_status=status)
             return
 
-        # Если статус не изменился, возвращаем исходную карточку и кнопку, чтобы админ мог повторить.
         rollback_request = await fetch_payment_request(payment_id, timeout=20)
         if rollback_request:
             await apply_admin_status_result(context, query.message, payment_id, rollback_request, processed_status=rollback_request.get("status"))
@@ -1575,53 +1599,18 @@ async def edit_payment_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
 
 async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
     try:
-        result = api("list_status_updates", {})
-        for request in result.get("requests", []):
+        # v207: Apps Script опрашиваем через api_async, иначе фоновой polling блокирует весь event loop
+        # и кнопки Telegram выглядят так, будто бот умер с открытыми глазами.
+        result = await api_async("list_status_updates", {}, timeout=45)
+        for request in (result.get("requests", []) or [])[:BOT_POLL_BATCH_LIMIT]:
             payment_id = request.get("paymentId")
-            admin_msg_id = request.get("telegramAdminMessageId")
-            manager_msg_id = request.get("telegramManagerMessageId")
-            tatyana_msg_id = request.get("telegramTatyanaMessageId")
-            manager_tg = request.get("telegramId")
-
-            # v162: при смене статуса на сайте иногда обновлялась только карточка менеджера.
-            # Причина — админский message_id мог не прийти в list_status_updates или edit падал,
-            # а бот всё равно отмечал статус как синхронизированный. Теперь подтягиваем полную
-            # заявку, используем локальный кэш message_id и отмечаем sync только после успешной
-            # обработки админской карточки/удаления.
             cached = PAYMENT_MESSAGE_CACHE.get(str(payment_id or ""), {})
-            full_request = None
-            try:
-                full_request = await fetch_payment_request(payment_id, timeout=20)
-            except Exception:
-                full_request = None
-            full_request = full_request or {}
-            request = dict(full_request or {}, **{k: v for k, v in (request or {}).items() if v not in (None, "")})
-
-            admin_ids = unique_int_ids(
-                admin_msg_id,
-                request.get("telegramAdminMessageId"),
-                full_request.get("telegramAdminMessageId"),
-                cached.get("admin_message_id"),
-                cached.get("admin_message_ids"),
-            )
-            manager_ids = unique_int_ids(
-                manager_msg_id,
-                request.get("telegramManagerMessageId"),
-                full_request.get("telegramManagerMessageId"),
-                cached.get("manager_message_id"),
-                cached.get("manager_message_ids"),
-            )
-            tatyana_ids = unique_int_ids(
-                tatyana_msg_id,
-                request.get("telegramTatyanaMessageId"),
-                full_request.get("telegramTatyanaMessageId"),
-                cached.get("tatyana_message_id"),
-                cached.get("tatyana_message_ids"),
-            )
-            manager_tg = manager_tg or full_request.get("telegramId") or cached.get("manager_telegram_id")
+            admin_ids = unique_int_ids(request.get("telegramAdminMessageId"), cached.get("admin_message_id"), cached.get("admin_message_ids"))
+            manager_ids = unique_int_ids(request.get("telegramManagerMessageId"), cached.get("manager_message_id"), cached.get("manager_message_ids"))
+            tatyana_ids = unique_int_ids(request.get("telegramTatyanaMessageId"), cached.get("tatyana_message_id"), cached.get("tatyana_message_ids"))
+            manager_tg = request.get("telegramId") or cached.get("manager_telegram_id")
 
             processed_ok = False
-
             if is_cashbox_archived(request):
                 processed_ok = bool(await remove_archived_payment_messages(
                     context,
@@ -1632,60 +1621,38 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
                 ))
             else:
                 remember_payment_messages(payment_id, admin_ids, manager_ids, manager_tg, tatyana_ids)
+                admin_edited = True
+                if admin_ids:
+                    admin_edited = False
+                    for aid in admin_ids:
+                        admin_edited = (await edit_payment_message(context, ADMIN_CHAT_ID, aid, request, "🧾 Заявка обновлена", is_admin=True)) or admin_edited
 
-                admin_edited = False
-                for aid in admin_ids:
-                    edited = await edit_payment_message(
-                        context,
-                        ADMIN_CHAT_ID,
-                        aid,
-                        request,
-                        "🧾 Заявка обновлена",
-                        is_admin=True,
-                    )
-                    admin_edited = admin_edited or edited
-
-                manager_edited = False
-                if manager_tg:
+                manager_edited = True
+                if manager_tg and manager_ids:
+                    manager_edited = False
                     for mid in manager_ids:
-                        edited = await edit_payment_message(
-                            context,
-                            int(manager_tg),
-                            mid,
-                            request,
-                            "🔔 Статус заявки обновлён",
-                            is_admin=False,
-                        )
-                        manager_edited = manager_edited or edited
+                        manager_edited = (await edit_payment_message(context, int(manager_tg), mid, request, "🔔 Статус заявки обновлён", is_admin=False)) or manager_edited
 
-                tatyana_ids_after = await sync_tatyana_payment_message(
-                    context,
-                    request,
-                    "🧾 Заявка по счету обновлена",
-                    tatyana_ids,
-                )
+                tatyana_ids_after = await sync_tatyana_payment_message(context, request, "🧾 Заявка по счету обновлена", tatyana_ids)
                 tatyana_ok = (not should_notify_tatyana(request)) or bool(tatyana_ids_after)
-
-                # Если админская карточка известна, она должна обновиться. Иначе не помечаем
-                # статус синхронизированным, чтобы polling повторил попытку, а не оставил
-                # админа в прошлом статусе. Татьянина view-only копия для "По счету" тоже
-                # должна обновиться или создаться, иначе polling повторит попытку.
-                processed_ok = (not admin_ids or admin_edited) and (not manager_ids or manager_edited) and tatyana_ok
+                processed_ok = admin_edited and manager_edited and tatyana_ok
 
             if processed_ok:
                 try:
-                    api("mark_status_synced", {"paymentId": payment_id, "status": request.get("status")})
-                except Exception:
-                    pass
+                    await api_async("mark_status_synced", {"paymentId": payment_id, "status": request.get("status")}, timeout=30)
+                except Exception as err:
+                    print(f"mark_status_synced failed for {payment_id}: {err}")
             else:
                 print(f"status sync not confirmed for {payment_id}: admin_ids={admin_ids}, manager_ids={manager_ids}")
     except Exception as err:
         print(f"poll_status_updates error: {err}")
 
+
 async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
     try:
-        result = api("list_unnotified", {})
-        for request in result.get("requests", []):
+        # v207: не блокируем Telegram callbacks синхронным requests.post.
+        result = await api_async("list_unnotified", {}, timeout=45)
+        for request in (result.get("requests", []) or [])[:BOT_POLL_BATCH_LIMIT]:
             payment_id = request.get("paymentId")
             if is_recently_published(payment_id):
                 continue
@@ -1715,12 +1682,13 @@ async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
 
             remember_recently_published(payment_id)
             remember_payment_messages(payment_id, admin_msg.message_id, manager_msg_id, manager_tg, tatyana_msg_id)
-            await mark_notified_retry(
-                payment_id,
-                admin_message_id=admin_msg.message_id,
-                manager_message_id=manager_msg_id,
-                tatyana_message_id=tatyana_msg_id,
-            )
+
+            async def _save_ids(pid=payment_id, aid=admin_msg.message_id, mid=manager_msg_id, tid=tatyana_msg_id):
+                await mark_notified_retry(pid, admin_message_id=aid, manager_message_id=mid, tatyana_message_id=tid)
+            try:
+                asyncio.create_task(_save_ids())
+            except RuntimeError:
+                pass
     except Exception as err:
         print(f"poll_site_requests error: {err}")
 
