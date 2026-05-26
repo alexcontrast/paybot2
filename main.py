@@ -686,8 +686,8 @@ def manager_keyboard(payment_id: str, status: str) -> Optional[InlineKeyboardMar
     return None
 
 
-def payment_status_label(status: str, payment_status: str = "") -> str:
-    normalized = payment_status or status or "Новая"
+def payment_status_label(status: str) -> str:
+    normalized = status or "Новая"
     if normalized == "Новая":
         return "🕒 На оплату"
     if normalized == "Оплачено":
@@ -699,8 +699,8 @@ def payment_status_label(status: str, payment_status: str = "") -> str:
     return normalized
 
 
-def money_status_label(status: str, money_status: str = "") -> str:
-    normalized = money_status or status or "Новая"
+def money_status_label(status: str) -> str:
+    normalized = status or "Новая"
     if normalized == "Деньги в кассе":
         return "✅ Деньги в кассе"
     if normalized in ["Отменено", "Отклонено"]:
@@ -715,8 +715,8 @@ def is_active_request_for_manager(request: Dict[str, Any]) -> bool:
 
 def payment_text(request: Dict[str, Any], title: str = "🧾 Заявка на оплату") -> str:
     status = request.get("status") or "Новая"
-    payment_status = payment_status_label(status, request.get("paymentStatus") or "")
-    money_status = money_status_label(status, request.get("moneyStatus") or "")
+    payment_status = payment_status_label(status)
+    money_status = money_status_label(status)
     card = request.get("cardNumber") or ""
     card_display = format_card_number_for_telegram(card)
     card_line = f"\nКарта: <code>{esc(card_display)}</code>" if card_display else ""
@@ -1499,12 +1499,12 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # v207: не делаем предварительный get_request перед сменой статуса.
     # При большом потоке заявок этот лишний запрос блокировал кнопку админа на 20+ секунд.
-    await safe_edit_text(query.message, old_text + "\n\n⏳ Ставлю действие в единую очередь…", parse_mode="HTML")
+    await safe_edit_text(query.message, old_text + "\n\n⏳ Записываю статус…", parse_mode="HTML")
 
     try:
         result = await api_async_try(
-            ["queue_payment_status_action", "admin_update_fast", "admin_update"],
-            {"paymentId": payment_id, "action": status, "status": status, "comment": "Telegram"},
+            ["admin_update_fast", "admin_update"],
+            {"paymentId": payment_id, "status": status, "comment": "Telegram"},
             timeout=45,
         )
         request = result.get("request", {})
