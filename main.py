@@ -649,7 +649,9 @@ def items_keyboard(items: List[Dict[str, Any]], allow_extra: bool) -> InlineKeyb
     for item in items:
         order = int(item.get("itemOrder") or 0)
         paid = fmt_money(item.get("paidAmount", 0))
-        label = f"{short(item.get('positionName') or item.get('contractorName'), 32)} · оплачено {paid}"
+        base_amount = fmt_money(item.get("budgetAmount", 0))
+        amount_label = "21%" if item.get("isManagerSalary") or item.get("_isManagerSalary") else "факт"
+        label = f"{short(item.get('positionName') or item.get('contractorName'), 28)} · {amount_label} {base_amount} · оплачено {paid}"
         rows.append([InlineKeyboardButton(label, callback_data=f"item:{order}")])
     if allow_extra:
         rows.append([InlineKeyboardButton("+ Добавить позицию", callback_data=f"item:{EXTRA_ITEM_ORDER}")])
