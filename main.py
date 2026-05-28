@@ -2816,7 +2816,7 @@ async def admin_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         sample = "\n" + "\n".join(lines) if lines else ""
         await update.message.reply_text(
-            "🔎 stable v254 ультра-лёгкий аудит админских карточек\n"
+            "🔎 stable v255 ультра-лёгкий аудит; repair capped to 5 админских карточек\n"
             f"Лимит: {result.get('requestedLimit')}\n"
             f"Активных заявок в выборке: {result.get('returned')}\n"
             f"С сохранённым Admin Message ID: {result.get('withAdminMessageId')}\n"
@@ -2831,43 +2831,85 @@ async def admin_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ admin_audit упал: {err}")
 
 async def admin_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Repair admin cards without spamming: edit saved admin message first, create new only if edit fails."""
+    """Repair admin cards in a very small, bounded batch.
+
+    Important: this command must never look like it is hanging. Telegram edits/sends are
+    network calls and old message IDs can be slow/bad, so we cap the batch hard and send
+    a progress update after every item. For larger repairs, run the command multiple times.
+    """
     if update.message is None:
         return
     if not (update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID)):
         await update.message.reply_text("Эта команда доступна только в админском чате.")
         return
-    limit = 15
+
+    requested = 5
     if context.args:
         try:
-            limit = max(1, min(int(context.args[0]), 40))
+            requested = int(context.args[0])
         except Exception:
-            limit = 15
-    progress = await update.message.reply_text(f"🔧 stable v254: чиню до {limit} админских карточек маленьким батчем…")
+            requested = 5
+
+    # v255: hard cap. Large repairs caused the bot to sit on "чиню до 40..." for minutes.
+    limit = max(1, min(requested, 5))
+    if requested > limit:
+        cap_note = f"\n⚠️ Запросили {requested}, но v255 чинит максимум {limit} за один проход. Запускай команду несколько раз."
+    else:
+        cap_note = ""
+
+    progress = await update.message.reply_text(
+        f"🔧 admin_repair: чиню до {limit} админских карточек маленьким безопасным батчем…" + cap_note
+    )
+
     checked = edited = recreated = saved = failed = already_missing = 0
     details = []
-    try:
-        result = await asyncio.wait_for(
-            api_async("list_admin_repair_candidates", {"limit": limit}, timeout=15),
-            timeout=18,
+
+    async def update_progress(extra: str = "") -> None:
+        text = (
+            "🔧 admin_repair в процессе\n"
+            f"Проверено: {checked}/{limit}\n"
+            f"Отредактировано старых: {edited}\n"
+            f"Создано новых вместо недоступных/пустых: {recreated}\n"
+            f"Сохранено Admin Message ID: {saved}\n"
+            f"Ошибок: {failed}"
         )
-        requests_list = result.get("requests", []) or []
+        if extra:
+            text += "\n" + extra[:600]
+        try:
+            await asyncio.wait_for(progress.edit_text(text), timeout=4)
+        except Exception:
+            # Progress edit is nice-to-have; never block the repair itself.
+            pass
+
+    try:
+        # Ultra-light server call. Keep the server limit equal to the small Telegram batch.
+        result = await asyncio.wait_for(
+            api_async("list_admin_repair_candidates", {"limit": limit}, timeout=8),
+            timeout=10,
+        )
+        requests_list = (result.get("requests", []) or [])[:limit]
         if not requests_list:
-            await progress.edit_text("✅ stable v254: сервер не вернул активных заявок для ремонта админских карточек.")
+            await progress.edit_text("✅ admin_repair: сервер не вернул активных заявок для ремонта админских карточек.")
             return
+
         for request in requests_list:
+            payment_id = request.get("paymentId") or ""
             checked += 1
-            payment_id = request.get("paymentId")
+            await update_progress(f"Текущая заявка: {payment_id}")
+
             admin_msg_id = str(request.get("telegramAdminMessageId") or "").strip()
             ok = False
             edit_err = ""
+
             if admin_msg_id:
+                # v255: strict but short; bad message IDs must not freeze the bot.
                 ok, edit_err = await _edit_admin_message_strict_v247(context, admin_msg_id, request)
                 if ok:
                     edited += 1
             else:
                 already_missing += 1
                 edit_err = "no saved Admin Message ID"
+
             if not ok:
                 try:
                     msg = await asyncio.wait_for(
@@ -2881,32 +2923,38 @@ async def admin_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                 request.get("paymentStatus"),
                                 request.get("moneyStatus"),
                             ),
-                            read_timeout=6,
-                            write_timeout=6,
-                            connect_timeout=6,
+                            read_timeout=5,
+                            write_timeout=5,
+                            connect_timeout=5,
                         ),
-                        timeout=8,
+                        timeout=6,
                     )
                     admin_msg_id = str(msg.message_id)
                     recreated += 1
                     if edit_err:
-                        details.append(f"{payment_id}: новая карточка ({edit_err[:90]})")
+                        details.append(f"{payment_id}: новая карточка ({edit_err[:80]})")
                 except Exception as send_err:
                     failed += 1
-                    details.append(f"{payment_id}: не удалось edit/send: {str(send_err)[:120]}")
+                    details.append(f"{payment_id}: не удалось edit/send: {str(send_err)[:110]}")
+                    await update_progress(details[-1])
                     continue
+
+            # Save the admin message id, but do not let a slow save erase the fact that the card exists.
             try:
                 await asyncio.wait_for(api_async("mark_notified", {
                     "paymentId": payment_id,
                     "adminMessageId": admin_msg_id,
                     "managerMessageId": str(request.get("telegramManagerMessageId") or ""),
                     "tatyanaMessageId": str(request.get("telegramTatyanaMessageId") or ""),
-                }, timeout=8), timeout=10)
+                }, timeout=6), timeout=8)
                 saved += 1
             except Exception as save_err:
                 failed += 1
-                details.append(f"{payment_id}: карточка есть, но ID не сохранился: {str(save_err)[:120]}")
-        tail = ("\n\nДетали:\n" + "\n".join(details[:10])) if details else ""
+                details.append(f"{payment_id}: карточка есть, но ID не сохранился: {str(save_err)[:110]}")
+
+            await update_progress(details[-1] if details else "")
+
+        tail = ("\n\nДетали:\n" + "\n".join(details[:8])) if details else ""
         await progress.edit_text(
             "✅ admin_repair завершён.\n"
             f"Проверено заявок: {checked}\n"
@@ -2914,14 +2962,16 @@ async def admin_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Создано новых только вместо недоступных/пустых: {recreated}\n"
             f"Из них без старого Admin ID: {already_missing}\n"
             f"Сохранено Admin Message ID: {saved}\n"
-            f"Ошибок: {failed}"
+            f"Ошибок: {failed}\n\n"
+            "Для следующих карточек снова запусти /admin_repair 5."
             + tail
         )
     except Exception as err:
+        err_text = f"⚠️ admin_repair упал/остановлен: {err}"
         try:
-            await progress.edit_text(f"⚠️ admin_repair упал: {err}")
+            await progress.edit_text(err_text)
         except Exception:
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ admin_repair упал: {err}")
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=err_text)
 
 # v250: keep old command names but route to safe repair/audit.
 async def admin_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2969,7 +3019,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("/health доступен только в админском чате.")
         return
     text = (
-        "✅ stable v254 жив. Админская доставка включена.\n"
+        "✅ stable v255 жив. Админская доставка включена.\n"
         "/admin_audit N — аудит сохранённых админских карточек\n"
         "/admin_repair N — починить старые карточки без дублей маленьким батчем\n"
         "\n"
@@ -3014,7 +3064,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def post_init(application):
-    await notify_admin_v238(application, "✅ Contrast Finance Bot stable v254 запущен. /admin_audit 25 — ультра-лёгкий аудит, /admin_repair 15 — ремонт без дублей.")
+    await notify_admin_v238(application, "✅ Contrast Finance Bot stable v255 запущен. /admin_audit 25 — ультра-лёгкий аудит; repair capped to 5, /admin_repair 15 — ремонт без дублей.")
     application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests_v248", 3, POLL_SITE_REQUESTS_SECONDS))
     application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates_v248", 8, POLL_SITE_REQUESTS_SECONDS))
 
