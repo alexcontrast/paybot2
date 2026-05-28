@@ -2949,11 +2949,62 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-async def post_init(application):
-    await notify_admin_v238(application, "✅ Contrast Finance Bot v247 запущен. /admin_audit 25 — аудит, /admin_repair 25 — ремонт админских карточек без дублей.")
-    application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests_v242", 3, POLL_SITE_REQUESTS_SECONDS))
-    application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates", 8, POLL_SITE_REQUESTS_SECONDS))
 
+# ===== v248 FIX VERSIONED HEALTH/START AND DISABLE DUPLICATE ADMIN_LAST =====
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat and update.effective_chat.id != ADMIN_CHAT_ID:
+        await update.message.reply_text("/health доступен только в админском чате.")
+        return
+    text = (
+        "✅ v248 жив. Админская доставка включена.\n"
+        "/admin_audit N — аудит сохранённых админских карточек\n"
+        "/admin_repair N — починить старые карточки без дублей\n"
+        "\n"
+        f"ADMIN_CHAT_ID: {ADMIN_CHAT_ID}\n"
+        f"APPS_SCRIPT_URL: {'есть' if APPS_SCRIPT_URL else 'нет'}\n"
+        f"BOT_API_SECRET: {'есть' if BOT_API_SECRET else 'нет'}\n"
+        f"POLL_SITE_REQUESTS_SECONDS: {POLL_SITE_REQUESTS_SECONDS}\n"
+        f"BOT_POLL_BATCH_LIMIT: {BOT_POLL_BATCH_LIMIT}\n"
+        "\nHealth больше не вызывает тяжёлый debug_polling, чтобы команда не зависала. "
+        "Для проверки карточек используйте /admin_audit 25."
+    )
+    await update.message.reply_text(text)
+
+async def admin_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # v248: never duplicate admin cards through the old /admin_last path.
+    # Route it to safe repair, which edits existing admin messages first.
+    await admin_repair(update, context)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = update.effective_user.id
+    chat_id = update.effective_chat.id if update.effective_chat else telegram_id
+    if chat_id == ADMIN_CHAT_ID:
+        await update.message.reply_text(
+            "✅ Админский чат активен.\n"
+            "/health — лёгкая диагностика без тяжёлого Apps Script debug\n"
+            "/poll_once — один короткий проход доставки\n"
+            "/admin_audit 25 — аудит админских карточек\n"
+            "/admin_repair 25 — починить старые карточки без дублей"
+        )
+        return ConversationHandler.END
+    await update.message.reply_text("Проверяю аккаунт…")
+    user = await get_bound_user_fast(telegram_id, context)
+    if user:
+        await update.message.reply_text(
+            f"✅ Аккаунт найден: {user.get('name', 'менеджер')}\nГлавное меню:",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Нужно привязать Telegram к аккаунту менеджера. Нажмите «Привязать аккаунт».",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    return ConversationHandler.END
+
+async def post_init(application):
+    await notify_admin_v238(application, "✅ Contrast Finance Bot v248 запущен. /admin_audit 25 — аудит, /admin_repair 25 — ремонт без дублей.")
+    application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests_v248", 3, POLL_SITE_REQUESTS_SECONDS))
+    application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates_v248", 8, POLL_SITE_REQUESTS_SECONDS))
 
 def main():
     require_env()
