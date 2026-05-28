@@ -2587,6 +2587,174 @@ async def post_init(application):
     application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates", 8, POLL_SITE_REQUESTS_SECONDS))
 
 
+
+# v246 — lightweight health and forced admin-card resend.
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
+        text = (
+            "✅ v246 жив. Админская доставка включена. /admin_last N — переотправить последние N карточек админу.\n"
+            f"ADMIN_CHAT_ID: {ADMIN_CHAT_ID}\n"
+            f"APPS_SCRIPT_URL: {'есть' if APPS_SCRIPT_URL else 'нет'}\n"
+            f"BOT_API_SECRET: {'есть' if BOT_API_SECRET else 'нет'}\n"
+            f"POLL_SITE_REQUESTS_SECONDS: {POLL_SITE_REQUESTS_SECONDS}\n"
+            f"BOT_POLL_BATCH_LIMIT: {BOT_POLL_BATCH_LIMIT}"
+        )
+        try:
+            diag = await asyncio.wait_for(api_async("debug_polling_fast", {}, timeout=10), timeout=12)
+            text += (
+                "\n\nApps Script debug_polling_fast:"
+                f"\nsource: {diag.get('sourceVersion')}"
+                f"\npaymentRows: {diag.get('paymentRows')}"
+                f"\nactiveSiteRows: {diag.get('activeSiteRows')}"
+                f"\nmissingAdmin: {diag.get('missingAdmin')}"
+                f"\nwithAdminMessageId: {diag.get('withAdminMessageId')}"
+                f"\nmissingManager: {diag.get('missingManager')}"
+                f"\nactiveSiteIncompleteTelegram: {diag.get('activeSiteIncompleteTelegram')}"
+                f"\ncandidates: {diag.get('candidates')}"
+                f"\nadminRecentResendAvailable: {diag.get('adminRecentResendAvailable')}"
+            )
+            note = diag.get("note")
+            if note:
+                text += f"\n\n{note}"
+            sample = diag.get("sample") or []
+            if sample:
+                lines = []
+                for item in sample[:6]:
+                    lines.append(
+                        "• {pid} · {mgr} · {date} · {status}/{pstatus} · admin:{admin} manager:{manager}".format(
+                            pid=item.get("paymentId") or "",
+                            mgr=item.get("manager") or "",
+                            date=item.get("eventDate") or "",
+                            status=item.get("status") or "",
+                            pstatus=item.get("paymentStatus") or "",
+                            admin="есть" if item.get("adminMsg") else "нет",
+                            manager="есть" if item.get("managerMsg") else "нет",
+                        )
+                    )
+                text += "\n\nПоследние активные заявки для /admin_last:\n" + "\n".join(lines)
+        except Exception as err:
+            text += f"\n\n⚠️ debug_polling_fast упал: {err}"
+        await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+    else:
+        await update.message.reply_text("Бот работает.", reply_markup=MAIN_KEYBOARD)
+
+async def admin_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force-send last active site requests to admin chat as NEW admin cards.
+    This intentionally ignores existing/stale Telegram Admin Message IDs.
+    It does not send or duplicate manager/Tatiana cards.
+    """
+    if update.message is None:
+        return
+    if not (update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID)):
+        await update.message.reply_text("Эта команда доступна только в админском чате.")
+        return
+    limit = 10
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 50))
+        except Exception:
+            limit = 10
+    progress = await update.message.reply_text(f"🔄 v246: переотправляю последние {limit} активных заявок админу…")
+    sent = saved = failed = 0
+    details = []
+    try:
+        result = await asyncio.wait_for(api_async("list_admin_recent_for_resend", {"limit": limit}, timeout=10), timeout=12)
+        requests_list = result.get("requests", []) or []
+        if not requests_list:
+            await progress.edit_text("✅ v246: сервер не вернул активных заявок для переотправки админу.")
+            return
+        for request in requests_list:
+            payment_id = request.get("paymentId")
+            try:
+                msg = await asyncio.wait_for(
+                    context.bot.send_message(
+                        chat_id=ADMIN_CHAT_ID,
+                        text=payment_text(request, "🧾 Заявка в админский чат"),
+                        parse_mode="HTML",
+                        reply_markup=admin_keyboard(
+                            payment_id,
+                            request.get("status"),
+                            request.get("paymentStatus"),
+                            request.get("moneyStatus"),
+                        ),
+                        read_timeout=8,
+                        write_timeout=8,
+                        connect_timeout=8,
+                    ),
+                    timeout=10,
+                )
+                sent += 1
+                try:
+                    await asyncio.wait_for(api_async("mark_notified", {
+                        "paymentId": payment_id,
+                        "adminMessageId": str(msg.message_id),
+                        "managerMessageId": str(request.get("telegramManagerMessageId") or ""),
+                        "tatyanaMessageId": str(request.get("telegramTatyanaMessageId") or ""),
+                    }, timeout=8), timeout=10)
+                    saved += 1
+                except Exception as save_err:
+                    failed += 1
+                    details.append(f"{payment_id}: отправлено, но Admin Message ID не сохранился: {save_err}")
+            except Exception as send_err:
+                failed += 1
+                details.append(f"{payment_id}: не отправлено админу: {send_err}")
+        tail = ("\n\nОшибки:\n" + "\n".join(details[:8])) if details else ""
+        await progress.edit_text(
+            "✅ v246 admin_last завершён.\n"
+            f"Получено от сервера: {len(requests_list)}\n"
+            f"Отправлено новых админских карточек: {sent}\n"
+            f"Сохранено новых Admin Message ID: {saved}\n"
+            f"Ошибок: {failed}" + tail
+        )
+    except Exception as err:
+        try:
+            await progress.edit_text(f"⚠️ v246 admin_last упал: {err}")
+        except Exception:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ v246 admin_last упал: {err}")
+
+async def admin_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # v246: old backfill tried to edit stale message IDs and could appear stuck.
+    # Keep the command name, but route it to the safer forced resend.
+    await admin_last(update, context)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return ConversationHandler.END
+    if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
+        await update.message.reply_text(
+            "✅ Админский чат активен.\n/health — лёгкая диагностика\n/poll_once — один короткий проход доставки\n/admin_last 10 — переотправить последние карточки админу",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+    telegram_id = update.effective_user.id
+    cached = get_cached_bound_user(telegram_id, context)
+    if cached:
+        await update.message.reply_text(
+            f"✅ Аккаунт найден: {cached.get('name', 'менеджер')}\nГлавное меню:",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+    await update.message.reply_text("Проверяю аккаунт…")
+    user = await get_bound_user_fast(telegram_id, context)
+    if user:
+        await update.message.reply_text(
+            f"✅ Аккаунт найден: {user.get('name', 'менеджер')}\nГлавное меню:",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Нужно привязать Telegram к аккаунту менеджера. Нажмите «Привязать аккаунт».",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    return ConversationHandler.END
+
+async def post_init(application):
+    await notify_admin_v238(application, "✅ Contrast Finance Bot v246 запущен. /health — лёгкая диагностика, /admin_last 10 — переотправить карточки админу.")
+    application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests_v242", 3, POLL_SITE_REQUESTS_SECONDS))
+    application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates", 8, POLL_SITE_REQUESTS_SECONDS))
+
 def main():
     require_env()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
@@ -2634,6 +2802,7 @@ def main():
     app.add_handler(CommandHandler("health", health))
     app.add_handler(CommandHandler("poll_once", poll_once))
     app.add_handler(CommandHandler("admin_backfill", admin_backfill))
+    app.add_handler(CommandHandler("admin_last", admin_last))
     app.add_error_handler(error_handler_v238)
 
     app.run_polling(drop_pending_updates=True)
