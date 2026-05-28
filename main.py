@@ -912,6 +912,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return ConversationHandler.END
 
+    # v241: админский чат не должен попадать в менеджерскую проверку me_fast.
+    if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
+        await update.message.reply_text(
+            "✅ Админский чат активен.\n/health — диагностика\n/poll_once — дослать недостающие карточки",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+
     telegram_id = update.effective_user.id
     cached = get_cached_bound_user(telegram_id, context)
     if cached:
@@ -1840,6 +1848,40 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+
+# ===== v241 STARTUP SAFETY HELPERS =====
+# v240 referenced these helpers but did not define them in this physical file.
+# That causes a startup NameError before polling begins, so /start and /health never answer.
+async def notify_admin_v238(application, text: str):
+    try:
+        if ADMIN_CHAT_ID:
+            await application.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=text,
+                read_timeout=8,
+                write_timeout=8,
+                connect_timeout=8,
+            )
+    except Exception as err:
+        print(f"admin startup notify failed: {err}")
+
+
+async def error_handler_v238(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = getattr(context, "error", None)
+    print(f"telegram handler error: {err}")
+    try:
+        if ADMIN_CHAT_ID:
+            await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=f"⚠️ Ошибка Telegram-бота v241: {err}",
+                read_timeout=8,
+                write_timeout=8,
+                connect_timeout=8,
+            )
+    except Exception as notify_err:
+        print(f"telegram error notify failed: {notify_err}")
+
 # ===== v240 ADMIN DELIVERY BACKFILL =====
 # Если заявка уже ушла менеджеру, но не ушла админу, не считаем её полностью опубликованной.
 # Публикуем только недостающие карточки и сохраняем уже существующие message_id.
@@ -1849,7 +1891,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
         text = (
-            "✅ v240 жив.\n"
+            "✅ v241 жив.\n"
             f"ADMIN_CHAT_ID: {ADMIN_CHAT_ID}\n"
             f"APPS_SCRIPT_URL: {'есть' if APPS_SCRIPT_URL else 'нет'}\n"
             f"BOT_API_SECRET: {'есть' if BOT_API_SECRET else 'нет'}\n"
@@ -2098,7 +2140,7 @@ async def poll_once(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(application):
-    await notify_admin_v238(application, "✅ Contrast Finance Bot v240 запущен. /health — диагностика, /poll_once — дослать недостающие карточки.")
+    await notify_admin_v238(application, "✅ Contrast Finance Bot v241 запущен. /health — диагностика, /poll_once — дослать недостающие карточки.")
     application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests", 3, POLL_SITE_REQUESTS_SECONDS))
     application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates", 8, POLL_SITE_REQUESTS_SECONDS))
 
