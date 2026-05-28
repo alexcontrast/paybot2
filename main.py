@@ -2144,6 +2144,271 @@ async def post_init(application):
     application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests", 3, POLL_SITE_REQUESTS_SECONDS))
     application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates", 8, POLL_SITE_REQUESTS_SECONDS))
 
+
+# ===== v242 ADMIN DELIVERY RESTORE / NO REFRESH BUTTON =====
+# Emergency stabilization after v232-v241: remove any blocking refresh behavior from the critical path.
+# Bot polling must deliver admin cards first, then manager cards, and never wait on Tatiana/card repairs before admin delivery.
+
+async def _send_tg_with_timeout_v242(coro, timeout: int = 12):
+    return await asyncio.wait_for(coro, timeout=timeout)
+
+async def _save_notified_ids_v242(payment_id: Any, admin_msg_id: Any = '', manager_msg_id: Any = '', tatyana_msg_id: Any = '') -> bool:
+    try:
+        await asyncio.wait_for(
+            api_async("mark_notified", {
+                "paymentId": payment_id,
+                "adminMessageId": str(admin_msg_id or ''),
+                "managerMessageId": str(manager_msg_id or ''),
+                "tatyanaMessageId": str(tatyana_msg_id or ''),
+            }, timeout=10),
+            timeout=12,
+        )
+        return True
+    except Exception as err:
+        print(f"v242 mark_notified failed for {payment_id}: {err}")
+        return False
+
+async def _send_admin_card_if_needed_v242(context: ContextTypes.DEFAULT_TYPE, request: Dict[str, Any]) -> str:
+    payment_id = request.get("paymentId")
+    existing_admin_id = str(request.get("telegramAdminMessageId") or "").strip()
+    if existing_admin_id:
+        return existing_admin_id
+    admin_msg = await _send_tg_with_timeout_v242(
+        context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=payment_text(request, "🧾 Новая заявка с сайта"),
+            parse_mode="HTML",
+            reply_markup=admin_keyboard(
+                payment_id,
+                request.get("status"),
+                request.get("paymentStatus"),
+                request.get("moneyStatus"),
+            ),
+            read_timeout=10,
+            write_timeout=10,
+            connect_timeout=10,
+        ),
+        timeout=14,
+    )
+    return str(admin_msg.message_id)
+
+async def _send_manager_card_if_needed_v242(context: ContextTypes.DEFAULT_TYPE, request: Dict[str, Any]) -> str:
+    payment_id = request.get("paymentId")
+    existing_manager_id = str(request.get("telegramManagerMessageId") or "").strip()
+    if existing_manager_id:
+        return existing_manager_id
+    manager_tg = request.get("telegramId")
+    if not manager_tg:
+        return ""
+    manager_msg = await _send_tg_with_timeout_v242(
+        context.bot.send_message(
+            chat_id=int(manager_tg),
+            text=payment_text(request, "🧾 Заявка создана на сайте"),
+            parse_mode="HTML",
+            reply_markup=manager_keyboard(payment_id, request.get("status")),
+            read_timeout=10,
+            write_timeout=10,
+            connect_timeout=10,
+        ),
+        timeout=14,
+    )
+    return str(manager_msg.message_id)
+
+async def _send_tatyana_background_v242(context: ContextTypes.DEFAULT_TYPE, request: Dict[str, Any]) -> str:
+    # Tatiana delivery is useful, but it must never block admin/manager delivery.
+    try:
+        if not should_notify_tatyana(request):
+            return str(request.get("telegramTatyanaMessageId") or "")
+        if str(request.get("telegramTatyanaMessageId") or "").strip():
+            return str(request.get("telegramTatyanaMessageId") or "").strip()
+        ids = await asyncio.wait_for(sync_tatyana_payment_message(context, request, "🧾 Новая заявка по счету"), timeout=12)
+        return str(ids[0]) if ids else ""
+    except Exception as err:
+        print(f"v242 tatyana skipped for {request.get('paymentId')}: {err}")
+        return str(request.get("telegramTatyanaMessageId") or "")
+
+async def _deliver_one_request_v242(context: ContextTypes.DEFAULT_TYPE, request: Dict[str, Any], allow_manager: bool = True, allow_tatyana: bool = False) -> Dict[str, Any]:
+    payment_id = request.get("paymentId")
+    report = {"paymentId": payment_id, "admin": "", "manager": "", "tatyana": "", "saved": False, "errors": []}
+    if not payment_id:
+        report["errors"].append("empty paymentId")
+        return report
+
+    admin_msg_id = str(request.get("telegramAdminMessageId") or "").strip()
+    manager_msg_id = str(request.get("telegramManagerMessageId") or "").strip()
+    tatyana_msg_id = str(request.get("telegramTatyanaMessageId") or "").strip()
+    manager_tg = request.get("telegramId")
+
+    # Critical rule: admin first. If admin send fails, do not let manager delivery hide the missing admin card.
+    try:
+        admin_msg_id = await _send_admin_card_if_needed_v242(context, request)
+        report["admin"] = "sent_or_exists"
+    except Exception as err:
+        report["errors"].append(f"admin send: {err}")
+        print(f"v242 admin send failed for {payment_id}: {err}")
+
+    if allow_manager and manager_tg:
+        try:
+            manager_msg_id = await _send_manager_card_if_needed_v242(context, request)
+            report["manager"] = "sent_or_exists" if manager_msg_id else "no_manager_id"
+        except Exception as err:
+            report["errors"].append(f"manager send: {err}")
+            print(f"v242 manager send failed for {payment_id}: {err}")
+
+    # Do not block on Tatiana in background polling; optional only for manual one-off.
+    if allow_tatyana:
+        tatyana_msg_id = await _send_tatyana_background_v242(context, request)
+        report["tatyana"] = "sent_or_exists" if tatyana_msg_id else "skipped"
+
+    if admin_msg_id or manager_msg_id or tatyana_msg_id:
+        remember_recently_published(payment_id)
+        remember_payment_messages(payment_id, admin_msg_id, manager_msg_id, manager_tg, tatyana_msg_id)
+        report["saved"] = await _save_notified_ids_v242(payment_id, admin_msg_id, manager_msg_id, tatyana_msg_id)
+    return report
+
+async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        result = await asyncio.wait_for(api_async("list_unnotified", {}, timeout=12), timeout=14)
+        requests_list = (result.get("requests", []) or [])[:BOT_POLL_BATCH_LIMIT]
+        if not requests_list:
+            return
+        print(f"v242 poll_site_requests: {len(requests_list)} incomplete Telegram delivery candidate(s)")
+        for request in requests_list:
+            payment_id = request.get("paymentId")
+            # If admin card is missing, never suppress by local recent cache.
+            existing_admin_id = str(request.get("telegramAdminMessageId") or "").strip()
+            if existing_admin_id and is_recently_published(payment_id):
+                continue
+            report = await _deliver_one_request_v242(context, request, allow_manager=True, allow_tatyana=False)
+            if report.get("errors"):
+                print(f"v242 delivery report errors: {report}")
+    except Exception as err:
+        print(f"v242 poll_site_requests error: {err}")
+
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
+        text = (
+            "✅ v242 жив. Админская доставка включена.\n"
+            f"ADMIN_CHAT_ID: {ADMIN_CHAT_ID}\n"
+            f"APPS_SCRIPT_URL: {'есть' if APPS_SCRIPT_URL else 'нет'}\n"
+            f"BOT_API_SECRET: {'есть' if BOT_API_SECRET else 'нет'}\n"
+            f"POLL_SITE_REQUESTS_SECONDS: {POLL_SITE_REQUESTS_SECONDS}\n"
+            f"BOT_POLL_BATCH_LIMIT: {BOT_POLL_BATCH_LIMIT}"
+        )
+        try:
+            diag = await asyncio.wait_for(api_async("debug_polling", {}, timeout=12), timeout=14)
+            text += (
+                "\n\nApps Script debug_polling:"
+                f"\nsource: {diag.get('sourceVersion')}"
+                f"\npaymentRows: {diag.get('paymentRows')}"
+                f"\nactiveSiteRows: {diag.get('activeSiteRows')}"
+                f"\nmissingAdmin: {diag.get('missingAdmin')}"
+                f"\nmissingManager: {diag.get('missingManager')}"
+                f"\nactiveSiteIncompleteTelegram: {diag.get('activeSiteIncompleteTelegram')}"
+                f"\ncandidates: {diag.get('candidates')}"
+            )
+            sample = diag.get("sample") or []
+            if sample:
+                lines = []
+                for item in sample[:6]:
+                    lines.append(
+                        "• {pid} · {mgr} · {date} · {status}/{pstatus} · admin:{admin} manager:{manager}".format(
+                            pid=item.get("paymentId") or "",
+                            mgr=item.get("manager") or "",
+                            date=item.get("eventDate") or "",
+                            status=item.get("status") or "",
+                            pstatus=item.get("paymentStatus") or "",
+                            admin="есть" if item.get("adminMsg") else "нет",
+                            manager="есть" if item.get("managerMsg") else "нет",
+                        )
+                    )
+                text += "\n\nБлижайшие неполные карточки:\n" + "\n".join(lines)
+        except Exception as err:
+            text += f"\n\n⚠️ debug_polling упал: {err}"
+        await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+    else:
+        await update.message.reply_text("Бот работает.", reply_markup=MAIN_KEYBOARD)
+
+async def poll_once(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    if not (update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID)):
+        await update.message.reply_text("Эта команда доступна только в админском чате.")
+        return
+    progress = await update.message.reply_text("🔄 v242: делаю один короткий проход доставки админских карточек…")
+    sent_admin = sent_manager = saved = failed = 0
+    lines = []
+    try:
+        result = await asyncio.wait_for(api_async("list_unnotified", {}, timeout=12), timeout=14)
+        requests_list = (result.get("requests", []) or [])[:BOT_POLL_BATCH_LIMIT]
+        for request in requests_list:
+            report = await _deliver_one_request_v242(context, request, allow_manager=True, allow_tatyana=False)
+            if report.get("admin"):
+                sent_admin += 1
+            if report.get("manager"):
+                sent_manager += 1
+            if report.get("saved"):
+                saved += 1
+            if report.get("errors"):
+                failed += 1
+                lines.append(str(report.get("paymentId")) + ": " + "; ".join(report.get("errors") or []))
+        detail = ("\n\nОшибки:\n" + "\n".join(lines[:6])) if lines else ""
+        await progress.edit_text(
+            "✅ v242 poll_once завершён.\n"
+            f"Получено от сервера: {len(requests_list)}\n"
+            f"Админские карточки обработаны: {sent_admin}\n"
+            f"Менеджерские карточки обработаны: {sent_manager}\n"
+            f"Message ID сохранены: {saved}\n"
+            f"Ошибок: {failed}" + detail
+        )
+    except Exception as err:
+        try:
+            await progress.edit_text(f"⚠️ v242 poll_once упал: {err}")
+        except Exception:
+            try:
+                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ v242 poll_once упал: {err}")
+            except Exception:
+                pass
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return ConversationHandler.END
+    if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
+        await update.message.reply_text(
+            "✅ Админский чат активен.\n/health — диагностика\n/poll_once — один короткий проход доставки",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+    telegram_id = update.effective_user.id
+    cached = get_cached_bound_user(telegram_id, context)
+    if cached:
+        await update.message.reply_text(
+            f"✅ Аккаунт найден: {cached.get('name', 'менеджер')}\nГлавное меню:",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+    await update.message.reply_text("Проверяю аккаунт…")
+    user = await get_bound_user_fast(telegram_id, context)
+    if user:
+        await update.message.reply_text(
+            f"✅ Аккаунт найден: {user.get('name', 'менеджер')}\nГлавное меню:",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Нужно привязать Telegram к аккаунту менеджера. Нажмите «Привязать аккаунт».",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    return ConversationHandler.END
+
+async def post_init(application):
+    await notify_admin_v238(application, "✅ Contrast Finance Bot v242 запущен. Админская доставка восстановлена. /health — диагностика, /poll_once — один проход.")
+    application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests_v242", 3, POLL_SITE_REQUESTS_SECONDS))
+    application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates", 8, POLL_SITE_REQUESTS_SECONDS))
+
+
 def main():
     require_env()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
