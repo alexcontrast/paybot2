@@ -2051,6 +2051,163 @@ async def error_handler_v238(update: object, context: ContextTypes.DEFAULT_TYPE)
         pass
 
 
+
+# ===== v239 POLLING DIAGNOSTICS + MANUAL ONE-SHOT POLL =====
+# Railway/env are alive. Now expose Apps Script polling diagnostics and a real one-shot pull.
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
+        base = (
+            "✅ v239 жив.\n"
+            f"ADMIN_CHAT_ID: {ADMIN_CHAT_ID}\n"
+            f"APPS_SCRIPT_URL: {'есть' if APPS_SCRIPT_URL else 'нет'}\n"
+            f"BOT_API_SECRET: {'есть' if BOT_API_SECRET else 'нет'}\n"
+            f"POLL_SITE_REQUESTS_SECONDS: {POLL_SITE_REQUESTS_SECONDS}\n"
+            f"BOT_POLL_BATCH_LIMIT: {BOT_POLL_BATCH_LIMIT}"
+        )
+        try:
+            diag = await api_async("debug_polling", {}, timeout=18)
+            sample = diag.get("sample") or []
+            sample_text = ""
+            if sample:
+                sample_text = "\n\nБлижайшие кандидаты:\n" + "\n".join([
+                    f"• {x.get('paymentId')} · {x.get('manager')} · {x.get('eventDate')} · {x.get('status')}/{x.get('paymentStatus')} · {x.get('amount')}"
+                    for x in sample[:5]
+                ])
+            text = (
+                base +
+                "\n\nApps Script debug_polling:"
+                f"\nsource: {diag.get('sourceVersion')}"
+                f"\npaymentRows: {diag.get('paymentRows')}"
+                f"\nactiveSiteRows: {diag.get('activeSiteRows')}"
+                f"\nactiveSiteWithoutTelegramMessages: {diag.get('activeSiteWithoutTelegramMessages')}"
+                f"\ncandidates: {diag.get('candidates')}" +
+                sample_text
+            )
+        except Exception as err:
+            text = base + f"\n\n⚠️ debug_polling не ответил: {err}"
+        await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+    else:
+        await update.message.reply_text("Бот работает.", reply_markup=MAIN_KEYBOARD)
+
+
+async def poll_once(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    if not (update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID)):
+        await update.message.reply_text("Эта команда доступна только в админском чате.")
+        return
+
+    progress = await update.message.reply_text("🔄 v239: делаю один короткий проход polling…")
+    try:
+        result = await api_async("list_unnotified", {}, timeout=18)
+        requests_list = (result.get("requests", []) or [])[:BOT_POLL_BATCH_LIMIT]
+        if not requests_list:
+            diag_text = ""
+            try:
+                diag = await api_async("debug_polling", {}, timeout=18)
+                diag_text = (
+                    f"\n\nДиагностика:"
+                    f"\npaymentRows: {diag.get('paymentRows')}"
+                    f"\nactiveSiteWithoutTelegramMessages: {diag.get('activeSiteWithoutTelegramMessages')}"
+                    f"\ncandidates: {diag.get('candidates')}"
+                    f"\nsource: {diag.get('sourceVersion')}"
+                )
+            except Exception as diag_err:
+                diag_text = f"\n\n⚠️ debug_polling тоже упал: {diag_err}"
+            await progress.edit_text(f"Готово: list_unnotified вернул 0 заявок.{diag_text}")
+            return
+
+        sent_admin = sent_manager = sent_tatyana = marked = failed = 0
+        lines = []
+        for request in requests_list:
+            payment_id = request.get("paymentId")
+            if not payment_id:
+                continue
+            admin_msg_id = ""
+            manager_msg_id = ""
+            tatyana_msg_id = ""
+            manager_tg = request.get("telegramId")
+
+            try:
+                admin_msg = await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=payment_text(request, "🧾 Новая заявка с сайта"),
+                    parse_mode="HTML",
+                    reply_markup=admin_keyboard(payment_id, request.get("status"), request.get("paymentStatus"), request.get("moneyStatus")),
+                    read_timeout=8, write_timeout=8, connect_timeout=8,
+                )
+                admin_msg_id = admin_msg.message_id
+                sent_admin += 1
+            except Exception as err:
+                failed += 1
+                lines.append(f"{payment_id}: admin send error: {err}")
+
+            if manager_tg:
+                try:
+                    manager_msg = await context.bot.send_message(
+                        chat_id=int(manager_tg),
+                        text=payment_text(request, "🧾 Заявка создана на сайте"),
+                        parse_mode="HTML",
+                        reply_markup=manager_keyboard(payment_id, request.get("status")),
+                        read_timeout=8, write_timeout=8, connect_timeout=8,
+                    )
+                    manager_msg_id = manager_msg.message_id
+                    sent_manager += 1
+                except Exception as err:
+                    failed += 1
+                    lines.append(f"{payment_id}: manager send error: {err}")
+
+            if should_notify_tatyana(request):
+                try:
+                    ids = await sync_tatyana_payment_message(context, request, "🧾 Новая заявка по счету")
+                    tatyana_msg_id = ids[0] if ids else ""
+                    if tatyana_msg_id:
+                        sent_tatyana += 1
+                except Exception as err:
+                    failed += 1
+                    lines.append(f"{payment_id}: tatyana send error: {err}")
+
+            if admin_msg_id or manager_msg_id or tatyana_msg_id:
+                remember_recently_published(payment_id)
+                remember_payment_messages(payment_id, admin_msg_id, manager_msg_id, manager_tg, tatyana_msg_id)
+                try:
+                    await api_async("mark_notified", {
+                        "paymentId": payment_id,
+                        "adminMessageId": admin_msg_id,
+                        "managerMessageId": manager_msg_id,
+                        "tatyanaMessageId": tatyana_msg_id,
+                    }, timeout=18)
+                    marked += 1
+                except Exception as err:
+                    failed += 1
+                    lines.append(f"{payment_id}: mark_notified error: {err}")
+
+        detail = ""
+        if lines:
+            detail = "\n\nОшибки:\n" + "\n".join(lines[:6])
+        await progress.edit_text(
+            f"✅ v239 poll_once завершён.\n"
+            f"Получено от сервера: {len(requests_list)}\n"
+            f"Админу отправлено: {sent_admin}\n"
+            f"Менеджерам отправлено: {sent_manager}\n"
+            f"Татьяне отправлено: {sent_tatyana}\n"
+            f"Помечено notified: {marked}\n"
+            f"Ошибок: {failed}" + detail
+        )
+    except Exception as err:
+        try:
+            await progress.edit_text(f"⚠️ v239 poll_once упал: {err}")
+        except Exception:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ v239 poll_once упал: {err}")
+
+
+async def post_init(application):
+    await notify_admin_v238(application, "✅ Contrast Finance Bot v239 запущен. /health — диагностика API, /poll_once — один ручной проход.")
+    application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests", 3, POLL_SITE_REQUESTS_SECONDS))
+    application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates", 8, POLL_SITE_REQUESTS_SECONDS))
+
 def main():
     require_env()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
@@ -2096,6 +2253,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_manager_action, pattern="^manager:"))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("health", health))
+    app.add_handler(CommandHandler("poll_once", poll_once))
     app.add_error_handler(error_handler_v238)
 
     app.run_polling(drop_pending_updates=True)
