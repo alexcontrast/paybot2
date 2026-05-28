@@ -2798,8 +2798,8 @@ async def admin_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             limit = 25
     try:
         result = await asyncio.wait_for(
-            api_async("audit_admin_repair_candidates", {"limit": limit}, timeout=8),
-            timeout=10,
+            api_async("audit_admin_repair_candidates", {"limit": limit}, timeout=15),
+            timeout=18,
         )
         lines = []
         for item in (result.get("sample") or [])[:10]:
@@ -2816,12 +2816,13 @@ async def admin_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         sample = "\n" + "\n".join(lines) if lines else ""
         await update.message.reply_text(
-            "🔎 v250 быстрый аудит админских карточек\n"
+            "🔎 stable v254 ультра-лёгкий аудит админских карточек\n"
             f"Лимит: {result.get('requestedLimit')}\n"
             f"Активных заявок в выборке: {result.get('returned')}\n"
             f"С сохранённым Admin Message ID: {result.get('withAdminMessageId')}\n"
             f"Без Admin Message ID: {result.get('missingAdminMessageId')}\n"
-            f"Сервер собрал аудит за: {result.get('elapsedMs')} мс\n\n"
+            f"Сервер собрал аудит за: {result.get('elapsedMs')} мс\n"
+            f"Просканировано последних строк: {result.get('scannedRows', '?')}\n\n"
             "Telegram не даёт заранее прочитать текст старых карточек. "
             "Точный счёт зависших будет после /admin_repair: edited = старая карточка починена, new = старая недоступна и создана новая."
             f"{sample}"
@@ -2842,17 +2843,17 @@ async def admin_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
             limit = max(1, min(int(context.args[0]), 40))
         except Exception:
             limit = 15
-    progress = await update.message.reply_text(f"🔧 v250: чиню до {limit} админских карточек маленьким батчем…")
+    progress = await update.message.reply_text(f"🔧 stable v254: чиню до {limit} админских карточек маленьким батчем…")
     checked = edited = recreated = saved = failed = already_missing = 0
     details = []
     try:
         result = await asyncio.wait_for(
-            api_async("list_admin_repair_candidates", {"limit": limit}, timeout=8),
-            timeout=10,
+            api_async("list_admin_repair_candidates", {"limit": limit}, timeout=15),
+            timeout=18,
         )
         requests_list = result.get("requests", []) or []
         if not requests_list:
-            await progress.edit_text("✅ v250: сервер не вернул активных заявок для ремонта админских карточек.")
+            await progress.edit_text("✅ stable v254: сервер не вернул активных заявок для ремонта админских карточек.")
             return
         for request in requests_list:
             checked += 1
@@ -2968,7 +2969,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("/health доступен только в админском чате.")
         return
     text = (
-        "✅ Бот жив. Админская доставка включена.\n"
+        "✅ stable v254 жив. Админская доставка включена.\n"
         "/admin_audit N — аудит сохранённых админских карточек\n"
         "/admin_repair N — починить старые карточки без дублей маленьким батчем\n"
         "\n"
@@ -2977,8 +2978,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"BOT_API_SECRET: {'есть' if BOT_API_SECRET else 'нет'}\n"
         f"POLL_SITE_REQUESTS_SECONDS: {POLL_SITE_REQUESTS_SECONDS}\n"
         f"BOT_POLL_BATCH_LIMIT: {BOT_POLL_BATCH_LIMIT}\n"
-        "\nHealth больше не вызывает тяжёлый debug_polling, чтобы команда не зависала. "
-        "Для проверки карточек используйте /admin_audit 25."
+        "\nHealth не вызывает Apps Script debug. /admin_audit теперь использует ультра-лёгкий scan последних строк."
     )
     await update.message.reply_text(text)
 
@@ -3014,7 +3014,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def post_init(application):
-    await notify_admin_v238(application, "✅ Contrast Finance Bot запущен. /admin_audit 25 — быстрый аудит, /admin_repair 15 — ремонт без дублей.")
+    await notify_admin_v238(application, "✅ Contrast Finance Bot stable v254 запущен. /admin_audit 25 — ультра-лёгкий аудит, /admin_repair 15 — ремонт без дублей.")
     application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests_v248", 3, POLL_SITE_REQUESTS_SECONDS))
     application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates_v248", 8, POLL_SITE_REQUESTS_SECONDS))
 
