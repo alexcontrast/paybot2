@@ -1,3 +1,4 @@
+# v234: Admin refresh button is admin-chat-only and runs non-blocking in background.
 # v230: Telegram admin buttons respect independent paymentStatus/moneyStatus and never leave
 # cards stuck on "Ставлю действие в единую очередь…" after the server already accepted the action.
 RECENTLY_PUBLISHED_PAYMENT_IDS = {}
@@ -939,7 +940,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # v233: админский чат не должен проходить менеджерскую привязку.
     # Раньше /start в админском чате показывал «Проверяю аккаунт…» и мог
     # зависнуть на me_fast, потому что админ — не менеджер сайта.
-    if is_admin_chat_update(update) or int(update.effective_user.id) == int(ADMIN_CHAT_ID):
+    if is_admin_chat_update(update):
         context.user_data.pop("bound_user", None)
         await update.message.reply_text(
             "Админское меню:",
@@ -1942,6 +1943,53 @@ async def refresh_recent_payment_cards_now(context: ContextTypes.DEFAULT_TYPE, l
 
     return {"scanned": scanned, "repaired": repaired}
 
+async def _run_admin_refresh_background(context: ContextTypes.DEFAULT_TYPE, chat_id: int, progress_message_id: Optional[int] = None):
+    """v234: run the heavy admin refresh outside the message handler.
+
+    The button must not keep Telegram stuck on «Актуализирую заявки…» while
+    Apps Script scans unnotified/recent requests. We acknowledge immediately,
+    then post/edit the final result when the background pass finishes.
+    """
+    if context.bot_data.get("admin_refresh_in_progress"):
+        return
+
+    context.bot_data["admin_refresh_in_progress"] = True
+    try:
+        bot_context = SimpleNamespace(bot=context.bot)
+        result = await publish_unnotified_site_requests_now(bot_context, max_rounds=4, per_round_limit=BOT_POLL_BATCH_LIMIT)
+        await poll_status_updates(bot_context)
+        recent = await refresh_recent_payment_cards_now(bot_context, limit=35)
+
+        published = int(result.get("published") or 0)
+        scanned = int(result.get("scanned") or 0)
+        repaired = int(recent.get("repaired") or 0)
+        recent_scanned = int(recent.get("scanned") or 0)
+        text = (
+            f"✅ Актуализация завершена. Новых заявок: {published}. "
+            f"Проверено новых: {scanned}. Обновлено карточек: {repaired}/{recent_scanned}."
+        )
+
+        if progress_message_id:
+            try:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text=text)
+                return
+            except Exception as err:
+                print(f"admin refresh final edit failed: {err}")
+
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=ADMIN_KEYBOARD)
+    except Exception as err:
+        text = f"⚠️ Не удалось актуализировать заявки: {err}"
+        if progress_message_id:
+            try:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text=text)
+                return
+            except Exception as edit_err:
+                print(f"admin refresh error edit failed: {edit_err}")
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=ADMIN_KEYBOARD)
+    finally:
+        context.bot_data["admin_refresh_in_progress"] = False
+
+
 async def refresh_admin_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_chat_update(update):
         if update.message:
@@ -1951,24 +1999,20 @@ async def refresh_admin_requests(update: Update, context: ContextTypes.DEFAULT_T
     if not update.message:
         return
 
-    progress_msg = await update.message.reply_text("🔄 Актуализирую заявки…")
+    if context.bot_data.get("admin_refresh_in_progress"):
+        await update.message.reply_text("🔄 Актуализация уже запущена. Дождись финального сообщения.", reply_markup=ADMIN_KEYBOARD)
+        return
+
+    progress_msg = await update.message.reply_text(
+        "🔄 Запустил актуализацию в фоне. Можно дальше пользоваться ботом.",
+        reply_markup=ADMIN_KEYBOARD,
+    )
+
     try:
-        result = await publish_unnotified_site_requests_now(context, max_rounds=8, per_round_limit=BOT_POLL_BATCH_LIMIT)
-        # Заодно дёргаем обновление статусов, чтобы зависшие карточки быстрее догнали сайт.
-        await poll_status_updates(context)
-        recent = await refresh_recent_payment_cards_now(context, limit=50)
-        published = int(result.get("published") or 0)
-        scanned = int(result.get("scanned") or 0)
-        repaired = int(recent.get("repaired") or 0)
-        recent_scanned = int(recent.get("scanned") or 0)
-        await safe_edit_text(
-            progress_msg,
-            f"✅ Актуализация завершена. Новых заявок: {published}. "
-            f"Проверено новых: {scanned}. Обновлено карточек: {repaired}/{recent_scanned}.",
-        )
-        await update.message.reply_text("Админское меню:", reply_markup=ADMIN_KEYBOARD)
-    except Exception as err:
-        await safe_edit_text(progress_msg, f"⚠️ Не удалось актуализировать заявки: {err}")
+        asyncio.create_task(_run_admin_refresh_background(context, update.effective_chat.id, progress_msg.message_id))
+    except RuntimeError:
+        # Fallback for environments where create_task is unexpectedly unavailable.
+        await _run_admin_refresh_background(context, update.effective_chat.id, progress_msg.message_id)
 
 
 async def bot_background_loop(application, worker, name: str, first: int, interval: int):
