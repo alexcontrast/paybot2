@@ -908,6 +908,95 @@ async def ensure_bound(update: Update, context: ContextTypes.DEFAULT_TYPE, force
         return None
 
 
+
+async def admin_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force-repair admin chat cards. Does not touch manager/Tatiana delivery."""
+    if update.message is None:
+        return
+    if not (update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID)):
+        await update.message.reply_text("Эта команда доступна только в админском чате.")
+        return
+    limit = 25
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 60))
+        except Exception:
+            limit = 25
+    progress = await update.message.reply_text(f"🔄 v243: восстанавливаю админские карточки, лимит {limit}…")
+    sent = edited = saved = failed = 0
+    details = []
+    try:
+        result = await asyncio.wait_for(api_async("list_admin_backfill_candidates", {"limit": limit}, timeout=14), timeout=16)
+        requests_list = result.get("requests", []) or []
+        if not requests_list:
+            await progress.edit_text("✅ v243: сервер не вернул заявок для восстановления админских карточек.")
+            return
+        for request in requests_list:
+            payment_id = request.get("paymentId")
+            admin_msg_id = str(request.get("telegramAdminMessageId") or "").strip()
+            ok_existing = False
+            if admin_msg_id:
+                ok_existing = await edit_payment_message(
+                    context,
+                    ADMIN_CHAT_ID,
+                    admin_msg_id,
+                    request,
+                    "🧾 Заявка обновлена / восстановлена",
+                    is_admin=True,
+                )
+                if ok_existing:
+                    edited += 1
+            if not ok_existing:
+                try:
+                    msg = await asyncio.wait_for(
+                        context.bot.send_message(
+                            chat_id=ADMIN_CHAT_ID,
+                            text=payment_text(request, "🧾 Заявка восстановлена в админский чат"),
+                            parse_mode="HTML",
+                            reply_markup=admin_keyboard(
+                                payment_id,
+                                request.get("status"),
+                                request.get("paymentStatus"),
+                                request.get("moneyStatus"),
+                            ),
+                            read_timeout=8,
+                            write_timeout=8,
+                            connect_timeout=8,
+                        ),
+                        timeout=10,
+                    )
+                    admin_msg_id = str(msg.message_id)
+                    sent += 1
+                except Exception as err:
+                    failed += 1
+                    details.append(f"{payment_id}: admin send failed: {err}")
+                    continue
+            try:
+                await asyncio.wait_for(api_async("mark_notified", {
+                    "paymentId": payment_id,
+                    "adminMessageId": admin_msg_id,
+                    "managerMessageId": str(request.get("telegramManagerMessageId") or ""),
+                    "tatyanaMessageId": str(request.get("telegramTatyanaMessageId") or ""),
+                }, timeout=10), timeout=12)
+                saved += 1
+            except Exception as err:
+                failed += 1
+                details.append(f"{payment_id}: save admin id failed: {err}")
+        tail = ("\n\nОшибки:\n" + "\n".join(details[:8])) if details else ""
+        await progress.edit_text(
+            "✅ v243 admin_backfill завершён.\n"
+            f"Получено от сервера: {len(requests_list)}\n"
+            f"Обновлено старых карточек: {edited}\n"
+            f"Отправлено новых админских карточек: {sent}\n"
+            f"Сохранено Admin Message ID: {saved}\n"
+            f"Ошибок: {failed}" + tail
+        )
+    except Exception as err:
+        try:
+            await progress.edit_text(f"⚠️ v243 admin_backfill упал: {err}")
+        except Exception:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ v243 admin_backfill упал: {err}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return ConversationHandler.END
@@ -2290,7 +2379,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
         text = (
-            "✅ v242 жив. Админская доставка включена.\n"
+            "✅ v243 жив. Админская доставка включена. /admin_backfill N — восстановить админские карточки.\n"
             f"ADMIN_CHAT_ID: {ADMIN_CHAT_ID}\n"
             f"APPS_SCRIPT_URL: {'есть' if APPS_SCRIPT_URL else 'нет'}\n"
             f"BOT_API_SECRET: {'есть' if BOT_API_SECRET else 'нет'}\n"
@@ -2372,12 +2461,101 @@ async def poll_once(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
+
+async def admin_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Force-repair admin chat cards. Does not touch manager/Tatiana delivery."""
+    if update.message is None:
+        return
+    if not (update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID)):
+        await update.message.reply_text("Эта команда доступна только в админском чате.")
+        return
+    limit = 25
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 60))
+        except Exception:
+            limit = 25
+    progress = await update.message.reply_text(f"🔄 v243: восстанавливаю админские карточки, лимит {limit}…")
+    sent = edited = saved = failed = 0
+    details = []
+    try:
+        result = await asyncio.wait_for(api_async("list_admin_backfill_candidates", {"limit": limit}, timeout=14), timeout=16)
+        requests_list = result.get("requests", []) or []
+        if not requests_list:
+            await progress.edit_text("✅ v243: сервер не вернул заявок для восстановления админских карточек.")
+            return
+        for request in requests_list:
+            payment_id = request.get("paymentId")
+            admin_msg_id = str(request.get("telegramAdminMessageId") or "").strip()
+            ok_existing = False
+            if admin_msg_id:
+                ok_existing = await edit_payment_message(
+                    context,
+                    ADMIN_CHAT_ID,
+                    admin_msg_id,
+                    request,
+                    "🧾 Заявка обновлена / восстановлена",
+                    is_admin=True,
+                )
+                if ok_existing:
+                    edited += 1
+            if not ok_existing:
+                try:
+                    msg = await asyncio.wait_for(
+                        context.bot.send_message(
+                            chat_id=ADMIN_CHAT_ID,
+                            text=payment_text(request, "🧾 Заявка восстановлена в админский чат"),
+                            parse_mode="HTML",
+                            reply_markup=admin_keyboard(
+                                payment_id,
+                                request.get("status"),
+                                request.get("paymentStatus"),
+                                request.get("moneyStatus"),
+                            ),
+                            read_timeout=8,
+                            write_timeout=8,
+                            connect_timeout=8,
+                        ),
+                        timeout=10,
+                    )
+                    admin_msg_id = str(msg.message_id)
+                    sent += 1
+                except Exception as err:
+                    failed += 1
+                    details.append(f"{payment_id}: admin send failed: {err}")
+                    continue
+            try:
+                await asyncio.wait_for(api_async("mark_notified", {
+                    "paymentId": payment_id,
+                    "adminMessageId": admin_msg_id,
+                    "managerMessageId": str(request.get("telegramManagerMessageId") or ""),
+                    "tatyanaMessageId": str(request.get("telegramTatyanaMessageId") or ""),
+                }, timeout=10), timeout=12)
+                saved += 1
+            except Exception as err:
+                failed += 1
+                details.append(f"{payment_id}: save admin id failed: {err}")
+        tail = ("\n\nОшибки:\n" + "\n".join(details[:8])) if details else ""
+        await progress.edit_text(
+            "✅ v243 admin_backfill завершён.\n"
+            f"Получено от сервера: {len(requests_list)}\n"
+            f"Обновлено старых карточек: {edited}\n"
+            f"Отправлено новых админских карточек: {sent}\n"
+            f"Сохранено Admin Message ID: {saved}\n"
+            f"Ошибок: {failed}" + tail
+        )
+    except Exception as err:
+        try:
+            await progress.edit_text(f"⚠️ v243 admin_backfill упал: {err}")
+        except Exception:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ v243 admin_backfill упал: {err}")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return ConversationHandler.END
     if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
         await update.message.reply_text(
-            "✅ Админский чат активен.\n/health — диагностика\n/poll_once — один короткий проход доставки",
+            "✅ Админский чат активен.\n/health — диагностика\n/poll_once — один короткий проход доставки\n/admin_backfill 25 — восстановить последние админские карточки",
             reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
@@ -2404,7 +2582,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def post_init(application):
-    await notify_admin_v238(application, "✅ Contrast Finance Bot v242 запущен. Админская доставка восстановлена. /health — диагностика, /poll_once — один проход.")
+    await notify_admin_v238(application, "✅ Contrast Finance Bot v243 запущен. /health — диагностика, /poll_once — один проход, /admin_backfill 25 — восстановить админские карточки.")
     application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests_v242", 3, POLL_SITE_REQUESTS_SECONDS))
     application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates", 8, POLL_SITE_REQUESTS_SECONDS))
 
@@ -2455,6 +2633,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("health", health))
     app.add_handler(CommandHandler("poll_once", poll_once))
+    app.add_handler(CommandHandler("admin_backfill", admin_backfill))
     app.add_error_handler(error_handler_v238)
 
     app.run_polling(drop_pending_updates=True)
