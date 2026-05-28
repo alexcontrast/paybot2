@@ -1,4 +1,3 @@
-# v236: Admin refresh has hard 45s final report and immediate duplicate-click lock.
 # v230: Telegram admin buttons respect independent paymentStatus/moneyStatus and never leave
 # cards stuck on "Ставлю действие в единую очередь…" after the server already accepted the action.
 RECENTLY_PUBLISHED_PAYMENT_IDS = {}
@@ -47,10 +46,6 @@ APPS_SCRIPT_URL = os.getenv("APPS_SCRIPT_URL")
 BOT_API_SECRET = os.getenv("BOT_API_SECRET")
 POLL_SITE_REQUESTS_SECONDS = int(os.getenv("POLL_SITE_REQUESTS_SECONDS", "20"))
 BOT_POLL_BATCH_LIMIT = int(os.getenv("BOT_POLL_BATCH_LIMIT", "5"))
-TG_ACTION_TIMEOUT_SECONDS = int(os.getenv("TG_ACTION_TIMEOUT_SECONDS", "6"))
-ADMIN_REFRESH_API_TIMEOUT_SECONDS = int(os.getenv("ADMIN_REFRESH_API_TIMEOUT_SECONDS", "14"))
-ADMIN_REFRESH_RECENT_LIMIT = int(os.getenv("ADMIN_REFRESH_RECENT_LIMIT", "12"))
-ADMIN_REFRESH_TOTAL_TIMEOUT_SECONDS = int(os.getenv("ADMIN_REFRESH_TOTAL_TIMEOUT_SECONDS", "45"))
 
 (
     BIND_PHONE,
@@ -67,14 +62,6 @@ ADMIN_REFRESH_TOTAL_TIMEOUT_SECONDS = int(os.getenv("ADMIN_REFRESH_TOTAL_TIMEOUT
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [["Новая заявка"], ["Мои заявки", "Привязать аккаунт"], ["Отменить"]],
-    resize_keyboard=True,
-    one_time_keyboard=False,
-)
-
-# v232: отдельная кнопка для админского чата. Она вручную запускает подтяжку
-# зависших/старых заявок с сайта и обновление статусов без Redeploy/перезапуска Railway.
-ADMIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["Актуализировать заявки"], ["Отменить"]],
     resize_keyboard=True,
     one_time_keyboard=False,
 )
@@ -269,7 +256,7 @@ async def _refresh_item_cache_background(telegram_id: Any, event_id: Any) -> Non
     ITEM_REFRESH_IN_PROGRESS.add(key)
     try:
         try:
-            result = await api_async("list_items_ultra", {"telegramId": telegram_id, "eventId": event_id}, timeout=ADMIN_REFRESH_API_TIMEOUT_SECONDS)
+            result = await api_async("list_items_ultra", {"telegramId": telegram_id, "eventId": event_id}, timeout=30)
         except Exception as err:
             err_text = str(err)
             if 'list_items_ultra' not in err_text and 'Неизвестное действие' not in err_text:
@@ -333,8 +320,12 @@ async def mark_notified_retry(payment_id: Any, admin_message_id: Any = None, man
     if tatyana_message_id is not None:
         payload["tatyanaMessageId"] = tatyana_message_id or ""
     try:
-        # v235: do not let admin refresh hang for minutes while saving message IDs.
-        await api_async("mark_notified", payload, timeout=ADMIN_REFRESH_API_TIMEOUT_SECONDS)
+        await api_retry(
+            "mark_notified",
+            payload,
+            attempts=4,
+            delay=2.5,
+        )
         return True
     except Exception as err:
         print(f"mark_notified failed for {payment_id}: {err}")
@@ -345,10 +336,11 @@ async def mark_tatyana_notified_retry(payment_id: Any, tatyana_message_id: Any) 
     if not payment_id or not tatyana_message_id:
         return False
     try:
-        await api_async(
+        await api_retry(
             "mark_tatyana_notified",
             {"paymentId": payment_id, "tatyanaMessageId": tatyana_message_id},
-            timeout=ADMIN_REFRESH_API_TIMEOUT_SECONDS,
+            attempts=3,
+            delay=2.0,
         )
         return True
     except Exception as err:
@@ -358,10 +350,7 @@ async def mark_tatyana_notified_retry(payment_id: Any, tatyana_message_id: Any) 
 
 async def safe_edit_text(message, text: str, reply_markup=None, parse_mode: Optional[str] = None) -> None:
     try:
-        await asyncio.wait_for(
-            message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode),
-            timeout=TG_ACTION_TIMEOUT_SECONDS,
-        )
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except Exception:
         pass
 
@@ -370,10 +359,7 @@ async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: Any, 
     if not chat_id or not message_id:
         return False
     try:
-        await asyncio.wait_for(
-            context.bot.delete_message(chat_id=int(chat_id), message_id=int(message_id)),
-            timeout=TG_ACTION_TIMEOUT_SECONDS,
-        )
+        await context.bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
         return True
     except Exception:
         return False
@@ -807,15 +793,12 @@ async def edit_tatyana_payment_message(context: ContextTypes.DEFAULT_TYPE, messa
     if not TATYANA_CHAT_ID or not message_id:
         return False
     try:
-        await asyncio.wait_for(
-            context.bot.edit_message_text(
-                chat_id=TATYANA_CHAT_ID,
-                message_id=int(message_id),
-                text=payment_text(request, title),
-                parse_mode="HTML",
-                reply_markup=None,
-            ),
-            timeout=TG_ACTION_TIMEOUT_SECONDS,
+        await context.bot.edit_message_text(
+            chat_id=TATYANA_CHAT_ID,
+            message_id=int(message_id),
+            text=payment_text(request, title),
+            parse_mode="HTML",
+            reply_markup=None,
         )
         return True
     except Exception as err:
@@ -859,14 +842,11 @@ async def sync_tatyana_payment_message(
         return edited_ids
 
     try:
-        msg = await asyncio.wait_for(
-            context.bot.send_message(
-                chat_id=TATYANA_CHAT_ID,
-                text=payment_text(request, title),
-                parse_mode="HTML",
-                reply_markup=None,
-            ),
-            timeout=TG_ACTION_TIMEOUT_SECONDS,
+        msg = await context.bot.send_message(
+            chat_id=TATYANA_CHAT_ID,
+            text=payment_text(request, title),
+            parse_mode="HTML",
+            reply_markup=None,
         )
         remember_payment_messages(payment_id, tatyana_message_id=msg.message_id)
         await mark_tatyana_notified_retry(payment_id, msg.message_id)
@@ -928,34 +908,19 @@ async def ensure_bound(update: Update, context: ContextTypes.DEFAULT_TYPE, force
         return None
 
 
-def keyboard_for_chat(update: Update):
-    try:
-        if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
-            return ADMIN_KEYBOARD
-    except Exception:
-        pass
-    return MAIN_KEYBOARD
-
-
-def is_admin_chat_update(update: Update) -> bool:
-    try:
-        return bool(update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID))
-    except Exception:
-        return False
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return ConversationHandler.END
 
-    # v233: админский чат не должен проходить менеджерскую привязку.
-    # Раньше /start в админском чате показывал «Проверяю аккаунт…» и мог
-    # зависнуть на me_fast, потому что админ — не менеджер сайта.
-    if is_admin_chat_update(update):
-        context.user_data.pop("bound_user", None)
+    # v237: аварийно безопасная ветка для админского чата.
+    # Не запускаем менеджерскую проверку me_fast и не показываем кнопку ручной актуализации,
+    # потому что версии v232-v236 могли подвесить polling/background loop.
+    if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
         await update.message.reply_text(
-            "Админское меню:",
-            reply_markup=ADMIN_KEYBOARD,
+            "✅ Админский чат активен.\n"
+            "Новые заявки и статусы подтягиваются фоновым polling.\n"
+            "Кнопку «Актуализировать заявки» временно отключил, чтобы она не подвешивала бота.",
+            reply_markup=ReplyKeyboardRemove(),
         )
         return ConversationHandler.END
 
@@ -964,7 +929,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cached:
         await update.message.reply_text(
             f"✅ Аккаунт найден: {cached.get('name', 'менеджер')}\nГлавное меню:",
-            reply_markup=keyboard_for_chat(update),
+            reply_markup=MAIN_KEYBOARD,
         )
         return ConversationHandler.END
 
@@ -975,13 +940,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user:
             schedule_flow_refresh(telegram_id)
             await safe_edit_text(progress_msg, f"✅ Аккаунт найден: {user.get('name', 'менеджер')}")
-            await update.message.reply_text("Главное меню:", reply_markup=keyboard_for_chat(update))
+            await update.message.reply_text("Главное меню:", reply_markup=MAIN_KEYBOARD)
             return ConversationHandler.END
 
         await safe_edit_text(progress_msg, "Telegram пока не привязан к аккаунту менеджера.")
         await update.message.reply_text(
             "Нажми «Привязать аккаунт» и введи телефон + PIN от сайта.",
-            reply_markup=keyboard_for_chat(update),
+            reply_markup=MAIN_KEYBOARD,
         )
         return ConversationHandler.END
     except Exception as err:
@@ -989,7 +954,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Проверка зависла или не ответила: {err}\n\n"
             "Попробуй ещё раз /start или нажми «Привязать аккаунт».",
-            reply_markup=keyboard_for_chat(update),
+            reply_markup=MAIN_KEYBOARD,
         )
         return ConversationHandler.END
 
@@ -1496,7 +1461,7 @@ async def set_manager_status_processing(context: ContextTypes.DEFAULT_TYPE, requ
 async def recover_admin_update_after_timeout(payment_id: Any, expected_status: str, attempts: int = 8) -> Optional[Dict[str, Any]]:
     for _ in range(max(1, attempts)):
         await asyncio.sleep(3)
-        request = await fetch_payment_request(payment_id, timeout=ADMIN_REFRESH_API_TIMEOUT_SECONDS)
+        request = await fetch_payment_request(payment_id, timeout=30)
         if request and admin_status_reached(
             expected_status,
             request.get("status"),
@@ -1580,7 +1545,7 @@ async def apply_admin_status_result(
 
     async def _mark_status_synced_background():
         try:
-            await api_async("mark_status_synced", {"paymentId": payment_id, "status": processed_status or effective_payment_status_from_request(request)}, timeout=ADMIN_REFRESH_API_TIMEOUT_SECONDS)
+            await api_async("mark_status_synced", {"paymentId": payment_id, "status": processed_status or effective_payment_status_from_request(request)}, timeout=30)
         except Exception as err:
             print(f"mark_status_synced background failed for {payment_id}: {err}")
 
@@ -1736,20 +1701,17 @@ async def edit_payment_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     if not chat_id or not message_id:
         return False
     try:
-        await asyncio.wait_for(
-            context.bot.edit_message_text(
-                chat_id=int(chat_id),
-                message_id=int(message_id),
-                text=payment_text(request, title),
-                parse_mode="HTML",
-                reply_markup=admin_keyboard(
-                    request.get("paymentId"),
-                    request.get("status"),
-                    request.get("paymentStatus"),
-                    request.get("moneyStatus"),
-                ) if is_admin else manager_keyboard(request.get("paymentId"), request.get("status")),
-            ),
-            timeout=TG_ACTION_TIMEOUT_SECONDS,
+        await context.bot.edit_message_text(
+            chat_id=int(chat_id),
+            message_id=int(message_id),
+            text=payment_text(request, title),
+            parse_mode="HTML",
+            reply_markup=admin_keyboard(
+                request.get("paymentId"),
+                request.get("status"),
+                request.get("paymentStatus"),
+                request.get("moneyStatus"),
+            ) if is_admin else manager_keyboard(request.get("paymentId"), request.get("status")),
         )
         return True
     except Exception:
@@ -1760,7 +1722,7 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
     try:
         # v207: Apps Script опрашиваем через api_async, иначе фоновой polling блокирует весь event loop
         # и кнопки Telegram выглядят так, будто бот умер с открытыми глазами.
-        result = await api_async("list_status_updates", {}, timeout=ADMIN_REFRESH_API_TIMEOUT_SECONDS)
+        result = await api_async("list_status_updates", {}, timeout=45)
         for request in (result.get("requests", []) or [])[:BOT_POLL_BATCH_LIMIT]:
             payment_id = request.get("paymentId")
             cached = PAYMENT_MESSAGE_CACHE.get(str(payment_id or ""), {})
@@ -1798,7 +1760,7 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
 
             if processed_ok:
                 try:
-                    await api_async("mark_status_synced", {"paymentId": payment_id, "status": effective_payment_status_from_request(request)}, timeout=ADMIN_REFRESH_API_TIMEOUT_SECONDS)
+                    await api_async("mark_status_synced", {"paymentId": payment_id, "status": effective_payment_status_from_request(request)}, timeout=30)
                 except Exception as err:
                     print(f"mark_status_synced failed for {payment_id}: {err}")
             else:
@@ -1807,71 +1769,38 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
         print(f"poll_status_updates error: {err}")
 
 
-async def publish_unnotified_site_requests_now(context: ContextTypes.DEFAULT_TYPE, max_rounds: int = 1, per_round_limit: int = BOT_POLL_BATCH_LIMIT) -> Dict[str, Any]:
-    """Publish unnotified site-created requests to Telegram.
-
-    v232: the same logic is used by background polling and by the admin button
-    "Актуализировать заявки". We intentionally do several small rounds for the
-    manual button, because old rows without Telegram message IDs can otherwise
-    block newer ones until the next scheduled poll.
-    """
-    published = 0
-    scanned = 0
-    seen = set()
-    rounds = max(1, int(max_rounds or 1))
-    limit = max(1, int(per_round_limit or BOT_POLL_BATCH_LIMIT))
-
-    for _ in range(rounds):
-        result = await api_async("list_unnotified", {}, timeout=ADMIN_REFRESH_API_TIMEOUT_SECONDS)
-        requests = (result.get("requests", []) or [])[:limit]
-        if not requests:
-            break
-
-        round_published = 0
-        for request in requests:
+async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # v207: не блокируем Telegram callbacks синхронным requests.post.
+        result = await api_async("list_unnotified", {}, timeout=45)
+        for request in (result.get("requests", []) or [])[:BOT_POLL_BATCH_LIMIT]:
             payment_id = request.get("paymentId")
-            if not payment_id:
-                continue
-            pid_key = str(payment_id)
-            if pid_key in seen:
-                continue
-            seen.add(pid_key)
-            scanned += 1
-
             if is_recently_published(payment_id):
                 continue
-
-            admin_msg = await asyncio.wait_for(
-                context.bot.send_message(
-                    chat_id=ADMIN_CHAT_ID,
-                    text=payment_text(request, "🧾 Новая заявка с сайта"),
-                    parse_mode="HTML",
-                    reply_markup=admin_keyboard(
-                        payment_id,
-                        request.get("status"),
-                        request.get("paymentStatus"),
-                        request.get("moneyStatus"),
-                    ),
+            admin_msg = await context.bot.send_message(
+                chat_id=ADMIN_CHAT_ID,
+                text=payment_text(request, "🧾 Новая заявка с сайта"),
+                parse_mode="HTML",
+                reply_markup=admin_keyboard(
+                    payment_id,
+                    request.get("status"),
+                    request.get("paymentStatus"),
+                    request.get("moneyStatus"),
                 ),
-                timeout=TG_ACTION_TIMEOUT_SECONDS,
             )
             manager_msg_id = ""
             manager_tg = request.get("telegramId")
             if manager_tg:
                 try:
-                    manager_msg = await asyncio.wait_for(
-                        context.bot.send_message(
-                            chat_id=int(manager_tg),
-                            text=payment_text(request, "🧾 Заявка создана на сайте"),
-                            parse_mode="HTML",
-                            reply_markup=manager_keyboard(payment_id, request.get("status")),
-                        ),
-                        timeout=TG_ACTION_TIMEOUT_SECONDS,
+                    manager_msg = await context.bot.send_message(
+                        chat_id=int(manager_tg),
+                        text=payment_text(request, "🧾 Заявка создана на сайте"),
+                        parse_mode="HTML",
+                        reply_markup=manager_keyboard(payment_id, request.get("status")),
                     )
                     manager_msg_id = manager_msg.message_id
                 except Exception:
                     manager_msg_id = ""
-
             tatyana_msg_id = ""
             if should_notify_tatyana(request):
                 tatyana_ids = await sync_tatyana_payment_message(context, request, "🧾 Новая заявка по счету")
@@ -1879,8 +1808,6 @@ async def publish_unnotified_site_requests_now(context: ContextTypes.DEFAULT_TYP
 
             remember_recently_published(payment_id)
             remember_payment_messages(payment_id, admin_msg.message_id, manager_msg_id, manager_tg, tatyana_msg_id)
-            published += 1
-            round_published += 1
 
             async def _save_ids(pid=payment_id, aid=admin_msg.message_id, mid=manager_msg_id, tid=tatyana_msg_id):
                 await mark_notified_retry(pid, admin_message_id=aid, manager_message_id=mid, tatyana_message_id=tid)
@@ -1888,244 +1815,9 @@ async def publish_unnotified_site_requests_now(context: ContextTypes.DEFAULT_TYP
                 asyncio.create_task(_save_ids())
             except RuntimeError:
                 pass
-
-        # If this round did not publish anything, repeating immediately will likely
-        # return the same still-saving rows. The normal background loop will try again.
-        if round_published == 0:
-            break
-        await asyncio.sleep(0.4)
-
-    return {"published": published, "scanned": scanned}
-
-
-async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await publish_unnotified_site_requests_now(context, max_rounds=1, per_round_limit=BOT_POLL_BATCH_LIMIT)
     except Exception as err:
         print(f"poll_site_requests error: {err}")
 
-
-
-async def refresh_recent_payment_cards_now(context: ContextTypes.DEFAULT_TYPE, limit: int = 40) -> Dict[str, Any]:
-    """v233: force-edit recent Telegram cards from current Sheet state.
-
-    This is the repair path for old cards stuck on «Ставлю действие в единую очередь…»:
-    sometimes the Sheet already has paymentStatus/moneyStatus, but status sync did
-    not emit an update or the bot process restarted and lost local cache. We read
-    recent rows with Telegram message ids and redraw those cards directly.
-    """
-    repaired = 0
-    scanned = 0
-    try:
-        result = await api_async("list_recent_requests", {"limit": int(limit or 40)}, timeout=ADMIN_REFRESH_API_TIMEOUT_SECONDS)
-        requests = result.get("requests", []) or []
-    except Exception as err:
-        print(f"refresh_recent_payment_cards_now list_recent_requests failed: {err}")
-        return {"scanned": 0, "repaired": 0, "error": str(err)}
-
-    for request in requests:
-        payment_id = request.get("paymentId")
-        if not payment_id:
-            continue
-        scanned += 1
-        cached = PAYMENT_MESSAGE_CACHE.get(str(payment_id or ""), {})
-        admin_ids = unique_int_ids(request.get("telegramAdminMessageId"), cached.get("admin_message_id"), cached.get("admin_message_ids"))
-        manager_ids = unique_int_ids(request.get("telegramManagerMessageId"), cached.get("manager_message_id"), cached.get("manager_message_ids"))
-        tatyana_ids = unique_int_ids(request.get("telegramTatyanaMessageId"), cached.get("tatyana_message_id"), cached.get("tatyana_message_ids"))
-        manager_tg = request.get("telegramId") or cached.get("manager_telegram_id")
-
-        changed = False
-        if is_cashbox_archived(request):
-            changed = bool(await remove_archived_payment_messages(
-                context,
-                request,
-                admin_message_id=admin_ids,
-                manager_message_id=manager_ids,
-                manager_telegram_id=manager_tg,
-            ))
-        else:
-            remember_payment_messages(payment_id, admin_ids, manager_ids, manager_tg, tatyana_ids)
-            for aid in admin_ids:
-                changed = (await edit_payment_message(context, ADMIN_CHAT_ID, aid, request, "🧾 Заявка обновлена", is_admin=True)) or changed
-            if manager_tg:
-                for mid in manager_ids:
-                    changed = (await edit_payment_message(context, int(manager_tg), mid, request, "🔔 Статус заявки обновлён", is_admin=False)) or changed
-            if should_notify_tatyana(request):
-                tatyana_after = await sync_tatyana_payment_message(context, request, "🧾 Заявка по счету обновлена", tatyana_ids)
-                changed = bool(tatyana_after) or changed
-
-        if changed:
-            repaired += 1
-            try:
-                await api_async("mark_status_synced", {"paymentId": payment_id, "status": effective_payment_status_from_request(request)}, timeout=ADMIN_REFRESH_API_TIMEOUT_SECONDS)
-            except Exception as err:
-                print(f"mark_status_synced after recent refresh failed for {payment_id}: {err}")
-
-    return {"scanned": scanned, "repaired": repaired}
-
-async def _run_step_with_timeout(label: str, coro, timeout_seconds: int) -> Dict[str, Any]:
-    try:
-        result = await asyncio.wait_for(coro, timeout=max(3, int(timeout_seconds or ADMIN_REFRESH_API_TIMEOUT_SECONDS)))
-        if isinstance(result, dict):
-            return dict(result, _label=label, _timeout=False)
-        return {"result": result, "_label": label, "_timeout": False}
-    except asyncio.TimeoutError:
-        print(f"admin refresh step timeout: {label}")
-        return {"_label": label, "_timeout": True, "error": "timeout"}
-    except Exception as err:
-        print(f"admin refresh step failed: {label}: {err}")
-        return {"_label": label, "_timeout": False, "error": str(err)}
-
-
-async def _admin_refresh_core(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
-    """v236: bounded admin refresh core.
-
-    This core must either return a final report or raise within the external
-    ADMIN_REFRESH_TOTAL_TIMEOUT_SECONDS guard. It never owns the duplicate-run flag;
-    the handler sets that flag before creating the task, so repeated clicks are
-    blocked immediately.
-    """
-    bot_context = SimpleNamespace(bot=context.bot)
-
-    result = await _run_step_with_timeout(
-        "new",
-        publish_unnotified_site_requests_now(bot_context, max_rounds=1, per_round_limit=min(BOT_POLL_BATCH_LIMIT, 3)),
-        min(12, ADMIN_REFRESH_API_TIMEOUT_SECONDS),
-    )
-    status = await _run_step_with_timeout(
-        "status",
-        poll_status_updates(bot_context),
-        min(12, ADMIN_REFRESH_API_TIMEOUT_SECONDS),
-    )
-    recent = await _run_step_with_timeout(
-        "recent",
-        refresh_recent_payment_cards_now(bot_context, limit=ADMIN_REFRESH_RECENT_LIMIT),
-        min(18, ADMIN_REFRESH_API_TIMEOUT_SECONDS + 4),
-    )
-
-    published = int(result.get("published") or 0)
-    scanned = int(result.get("scanned") or 0)
-    repaired = int(recent.get("repaired") or 0)
-    recent_scanned = int(recent.get("scanned") or 0)
-    slow = [x.get("_label") for x in (result, status, recent) if x.get("_timeout")]
-    errors = [x.get("_label") for x in (result, status, recent) if x.get("error") and not x.get("_timeout")]
-
-    text = (
-        f"✅ Быстрая актуализация завершена. Новых заявок: {published}. "
-        f"Проверено новых: {scanned}. Обновлено карточек: {repaired}/{recent_scanned}."
-    )
-    if slow:
-        text += "\n⏱ Медленные шаги остановлены: " + ", ".join(slow) + ". Фоновый polling продолжит сам."
-    if errors:
-        text += "\n⚠️ Ошибки в шагах: " + ", ".join(errors) + "."
-    if published == 0 and repaired == 0 and not slow and not errors:
-        text += "\nℹ️ Сервер не вернул новых или отличающихся карточек. Если на сайте статус уже изменён, нажми кнопку статуса на конкретной карточке ещё раз или проверь Telegram Message ID в строке заявки."
-    return text
-
-
-async def _run_admin_refresh_background(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    progress_message_id: Optional[int] = None,
-    flag_already_set: bool = False,
-):
-    """v236: admin refresh cannot silently run forever.
-
-    v235 still allowed a silent background task failure and duplicate clicks because
-    the in-progress flag was set inside the scheduled task. v236 sets it in the
-    handler before scheduling and wraps the whole job in a hard timeout.
-    """
-    if not flag_already_set:
-        if context.bot_data.get("admin_refresh_in_progress"):
-            return
-        context.bot_data["admin_refresh_in_progress"] = True
-
-    try:
-        try:
-            text = await asyncio.wait_for(
-                _admin_refresh_core(context, chat_id),
-                timeout=max(15, int(ADMIN_REFRESH_TOTAL_TIMEOUT_SECONDS or 45)),
-            )
-        except asyncio.TimeoutError:
-            text = (
-                "⏱ Быстрая актуализация остановлена по таймауту. "
-                "Я не буду держать процесс бесконечно; фоновый polling продолжит догонять заявки. "
-                "Если конкретная карточка зависла, пришли Payment ID/скрин — починим точечно."
-            )
-        except Exception as err:
-            text = f"⚠️ Не удалось актуализировать заявки: {err}"
-
-        delivered = False
-        if progress_message_id:
-            try:
-                await asyncio.wait_for(
-                    context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text=text),
-                    timeout=TG_ACTION_TIMEOUT_SECONDS,
-                )
-                delivered = True
-            except Exception as err:
-                print(f"admin refresh final edit failed: {err}")
-
-        if not delivered:
-            try:
-                await asyncio.wait_for(
-                    context.bot.send_message(chat_id=chat_id, text=text, reply_markup=ADMIN_KEYBOARD),
-                    timeout=TG_ACTION_TIMEOUT_SECONDS,
-                )
-            except Exception as send_err:
-                print(f"admin refresh final send failed: {send_err}")
-    finally:
-        context.bot_data["admin_refresh_in_progress"] = False
-
-
-async def refresh_admin_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin_chat_update(update):
-        if update.message:
-            await update.message.reply_text("Эта кнопка работает только в админском чате.", reply_markup=MAIN_KEYBOARD)
-        return
-
-    if not update.message:
-        return
-
-    if context.bot_data.get("admin_refresh_in_progress"):
-        await update.message.reply_text("🔄 Актуализация уже запущена. Дождись финального сообщения.", reply_markup=ADMIN_KEYBOARD)
-        return
-
-    # v236: block duplicate clicks immediately, before the background task has a
-    # chance to start. This fixes repeated refresh launches.
-    context.bot_data["admin_refresh_in_progress"] = True
-    try:
-        progress_msg = await asyncio.wait_for(
-            update.message.reply_text(
-                "🔄 Запустил быструю актуализацию в фоне. Обычно это до 45 секунд. Можно дальше пользоваться ботом.",
-                reply_markup=ADMIN_KEYBOARD,
-            ),
-            timeout=TG_ACTION_TIMEOUT_SECONDS,
-        )
-    except Exception:
-        context.bot_data["admin_refresh_in_progress"] = False
-        raise
-
-    task_coro = _run_admin_refresh_background(
-        context,
-        update.effective_chat.id,
-        progress_msg.message_id,
-        flag_already_set=True,
-    )
-    try:
-        # PTB Application.create_task keeps task exceptions visible in bot logs.
-        if getattr(context, "application", None):
-            context.application.create_task(task_coro)
-        else:
-            asyncio.create_task(task_coro)
-    except Exception as err:
-        print(f"admin refresh schedule failed, running inline: {err}")
-        await _run_admin_refresh_background(
-            context,
-            update.effective_chat.id,
-            progress_msg.message_id,
-            flag_already_set=True,
-        )
 
 async def bot_background_loop(application, worker, name: str, first: int, interval: int):
     await asyncio.sleep(max(0, first))
@@ -2153,9 +1845,25 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         track_update_message(update, context)
         await cleanup_payment_flow_messages(context, update.effective_chat.id)
-        await update.message.reply_text("Действие отменено.", reply_markup=keyboard_for_chat(update))
+        await update.message.reply_text("Действие отменено.", reply_markup=MAIN_KEYBOARD)
     return ConversationHandler.END
 
+
+
+
+async def admin_refresh_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # v237: старую клавиатуру Telegram может держать локально после v232-v236.
+    # Отвечаем быстро и убираем кнопку, не запускаем тяжёлый refresh.
+    if update.message is None:
+        return
+    if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
+        await update.message.reply_text(
+            "⚠️ Ручную актуализацию временно отключил.\n"
+            "Бот снова работает через обычный фоновый polling; старую кнопку убираю из клавиатуры.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await update.message.reply_text("Эта кнопка доступна только в админском чате.", reply_markup=MAIN_KEYBOARD)
 
 def main():
     require_env()
@@ -2196,8 +1904,8 @@ def main():
 
     app.add_handler(bind_conversation)
     app.add_handler(request_conversation)
-    app.add_handler(MessageHandler(filters.Regex("^Актуализировать заявки$"), refresh_admin_requests))
-    app.add_handler(CommandHandler("refresh_requests", refresh_admin_requests))
+    app.add_handler(MessageHandler(filters.Regex("^Актуализировать заявки$"), admin_refresh_disabled))
+    app.add_handler(CommandHandler("refresh_requests", admin_refresh_disabled))
     app.add_handler(MessageHandler(filters.Regex("^Мои заявки$"), my_requests))
     app.add_handler(MessageHandler(filters.Regex("^Отменить$"), cancel))
     app.add_handler(CallbackQueryHandler(handle_admin_action, pattern="^admin:"))
