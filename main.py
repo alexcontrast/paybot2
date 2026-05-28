@@ -2755,6 +2755,206 @@ async def post_init(application):
     application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests_v242", 3, POLL_SITE_REQUESTS_SECONDS))
     application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates", 8, POLL_SITE_REQUESTS_SECONDS))
 
+
+# ===== v247 ADMIN CARD AUDIT + REPAIR WITHOUT CHAT SPAM =====
+async def _edit_admin_message_strict_v247(context: ContextTypes.DEFAULT_TYPE, message_id: Any, request: Dict[str, Any]) -> tuple[bool, str]:
+    if not message_id:
+        return False, "empty message id"
+    try:
+        await asyncio.wait_for(
+            context.bot.edit_message_text(
+                chat_id=int(ADMIN_CHAT_ID),
+                message_id=int(message_id),
+                text=payment_text(request, "🧾 Заявка обновлена / проверена"),
+                parse_mode="HTML",
+                reply_markup=admin_keyboard(
+                    request.get("paymentId"),
+                    request.get("status"),
+                    request.get("paymentStatus"),
+                    request.get("moneyStatus"),
+                ),
+                read_timeout=6,
+                write_timeout=6,
+                connect_timeout=6,
+            ),
+            timeout=8,
+        )
+        return True, ""
+    except Exception as err:
+        return False, str(err)
+
+async def admin_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return
+    if not (update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID)):
+        await update.message.reply_text("Эта команда доступна только в админском чате.")
+        return
+    limit = 25
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 100))
+        except Exception:
+            limit = 25
+    try:
+        result = await asyncio.wait_for(api_async("list_admin_repair_candidates", {"limit": limit}, timeout=10), timeout=12)
+        requests_list = result.get("requests", []) or []
+        lines = []
+        for item in requests_list[:10]:
+            lines.append(
+                "• {pid} · {mgr} · {date} · {status}/{pstatus} · adminID:{admin}".format(
+                    pid=item.get("paymentId") or "",
+                    mgr=item.get("manager") or "",
+                    date=item.get("eventDate") or "",
+                    status=item.get("status") or "",
+                    pstatus=item.get("paymentStatus") or "",
+                    admin="есть" if item.get("telegramAdminMessageId") else "нет",
+                )
+            )
+        sample = "\n" + "\n".join(lines) if lines else ""
+        await update.message.reply_text(
+            "🔎 v247 audit админских карточек\n"
+            f"Проверяемый лимит: {result.get('requestedLimit')}\n"
+            f"Активных заявок в выборке: {result.get('returned')}\n"
+            f"С сохранённым Admin Message ID: {result.get('withAdminMessageId')}\n"
+            f"Без Admin Message ID: {result.get('missingAdminMessageId')}\n\n"
+            "Точный счёт зависших/удалённых карточек Telegram не отдаёт заранее. "
+            "Его покажет /admin_repair: edit=починили существующую карточку, new=старая карточка недоступна и создана новая."
+            f"{sample}"
+        )
+    except Exception as err:
+        await update.message.reply_text(f"⚠️ v247 admin_audit упал: {err}")
+
+async def admin_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Repair admin cards without spamming: edit saved admin message first, create new only if edit fails."""
+    if update.message is None:
+        return
+    if not (update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID)):
+        await update.message.reply_text("Эта команда доступна только в админском чате.")
+        return
+    limit = 25
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 100))
+        except Exception:
+            limit = 25
+    progress = await update.message.reply_text(f"🔧 v247: проверяю и чиню до {limit} админских карточек…")
+    checked = edited = recreated = saved = failed = already_missing = 0
+    details = []
+    try:
+        result = await asyncio.wait_for(api_async("list_admin_repair_candidates", {"limit": limit}, timeout=10), timeout=12)
+        requests_list = result.get("requests", []) or []
+        if not requests_list:
+            await progress.edit_text("✅ v247: сервер не вернул активных заявок для ремонта админских карточек.")
+            return
+        for request in requests_list:
+            checked += 1
+            payment_id = request.get("paymentId")
+            admin_msg_id = str(request.get("telegramAdminMessageId") or "").strip()
+            ok = False
+            edit_err = ""
+            if admin_msg_id:
+                ok, edit_err = await _edit_admin_message_strict_v247(context, admin_msg_id, request)
+                if ok:
+                    edited += 1
+            else:
+                already_missing += 1
+                edit_err = "no saved Admin Message ID"
+            if not ok:
+                try:
+                    msg = await asyncio.wait_for(
+                        context.bot.send_message(
+                            chat_id=ADMIN_CHAT_ID,
+                            text=payment_text(request, "🧾 Заявка восстановлена в админский чат"),
+                            parse_mode="HTML",
+                            reply_markup=admin_keyboard(
+                                payment_id,
+                                request.get("status"),
+                                request.get("paymentStatus"),
+                                request.get("moneyStatus"),
+                            ),
+                            read_timeout=6,
+                            write_timeout=6,
+                            connect_timeout=6,
+                        ),
+                        timeout=8,
+                    )
+                    admin_msg_id = str(msg.message_id)
+                    recreated += 1
+                    if edit_err:
+                        details.append(f"{payment_id}: новая карточка, старая не редактировалась ({edit_err[:90]})")
+                except Exception as send_err:
+                    failed += 1
+                    details.append(f"{payment_id}: не удалось ни edit, ни send: {str(send_err)[:120]}")
+                    continue
+            try:
+                await asyncio.wait_for(api_async("mark_notified", {
+                    "paymentId": payment_id,
+                    "adminMessageId": admin_msg_id,
+                    "managerMessageId": str(request.get("telegramManagerMessageId") or ""),
+                    "tatyanaMessageId": str(request.get("telegramTatyanaMessageId") or ""),
+                }, timeout=8), timeout=10)
+                saved += 1
+            except Exception as save_err:
+                failed += 1
+                details.append(f"{payment_id}: карточка есть, но ID не сохранился: {str(save_err)[:120]}")
+        tail = ("\n\nДетали:\n" + "\n".join(details[:10])) if details else ""
+        await progress.edit_text(
+            "✅ v247 admin_repair завершён.\n"
+            f"Проверено заявок: {checked}\n"
+            f"Отредактировано существующих карточек: {edited}\n"
+            f"Создано новых только вместо недоступных/пустых: {recreated}\n"
+            f"Из них без старого Admin ID: {already_missing}\n"
+            f"Сохранено Admin Message ID: {saved}\n"
+            f"Ошибок: {failed}"
+            + tail
+        )
+    except Exception as err:
+        try:
+            await progress.edit_text(f"⚠️ v247 admin_repair упал: {err}")
+        except Exception:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ v247 admin_repair упал: {err}")
+
+# v247: keep old command name but make it safe repair instead of duplicate resend.
+async def admin_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await admin_repair(update, context)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return ConversationHandler.END
+    if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
+        await update.message.reply_text(
+            "✅ Админский чат активен.\n/health — лёгкая диагностика\n/poll_once — один короткий проход доставки\n/admin_audit 25 — посчитать кандидатов\n/admin_repair 25 — починить старые карточки без дублей",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+    telegram_id = update.effective_user.id
+    cached = get_cached_bound_user(telegram_id, context)
+    if cached:
+        await update.message.reply_text(
+            f"✅ Аккаунт найден: {cached.get('name', 'менеджер')}\nГлавное меню:",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+    await update.message.reply_text("Проверяю аккаунт…")
+    user = await get_bound_user_fast(telegram_id, context)
+    if user:
+        await update.message.reply_text(
+            f"✅ Аккаунт найден: {user.get('name', 'менеджер')}\nГлавное меню:",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Нужно привязать Telegram к аккаунту менеджера. Нажмите «Привязать аккаунт».",
+        reply_markup=MAIN_KEYBOARD,
+    )
+    return ConversationHandler.END
+
+async def post_init(application):
+    await notify_admin_v238(application, "✅ Contrast Finance Bot v247 запущен. /admin_audit 25 — аудит, /admin_repair 25 — ремонт админских карточек без дублей.")
+    application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests_v242", 3, POLL_SITE_REQUESTS_SECONDS))
+    application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates", 8, POLL_SITE_REQUESTS_SECONDS))
+
+
 def main():
     require_env()
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
@@ -2803,6 +3003,8 @@ def main():
     app.add_handler(CommandHandler("poll_once", poll_once))
     app.add_handler(CommandHandler("admin_backfill", admin_backfill))
     app.add_handler(CommandHandler("admin_last", admin_last))
+    app.add_handler(CommandHandler("admin_audit", admin_audit))
+    app.add_handler(CommandHandler("admin_repair", admin_repair))
     app.add_error_handler(error_handler_v238)
 
     app.run_polling(drop_pending_updates=True)
