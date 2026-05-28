@@ -1,3 +1,5 @@
+# v230: Telegram admin buttons respect independent paymentStatus/moneyStatus and never leave
+# cards stuck on "Ставлю действие в единую очередь…" after the server already accepted the action.
 RECENTLY_PUBLISHED_PAYMENT_IDS = {}
 RECENTLY_PUBLISHED_TTL_SECONDS = 10 * 60
 PAYMENT_MESSAGE_CACHE = {}
@@ -60,6 +62,14 @@ BOT_POLL_BATCH_LIMIT = int(os.getenv("BOT_POLL_BATCH_LIMIT", "5"))
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [["Новая заявка"], ["Мои заявки", "Привязать аккаунт"], ["Отменить"]],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+)
+
+# v232: отдельная кнопка для админского чата. Она вручную запускает подтяжку
+# зависших/старых заявок с сайта и обновление статусов без Redeploy/перезапуска Railway.
+ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    [["Актуализировать заявки"], ["Отменить"]],
     resize_keyboard=True,
     one_time_keyboard=False,
 )
@@ -412,7 +422,8 @@ async def cleanup_payment_flow_messages(
 
 def is_cashbox_archived(request: Dict[str, Any]) -> bool:
     """Telegram should remove terminal/archived request cards from chats."""
-    return (request.get("status") or "") in ["Деньги в кассе", "Отменено", "Отклонено"]
+    effective = effective_payment_status_from_request(request or {}) if 'effective_payment_status_from_request' in globals() else (request.get("status") or "")
+    return effective in ["Деньги в кассе", "Отменено", "Отклонено"]
 
 
 def remember_payment_messages(payment_id: Any, admin_message_id: Any = None, manager_message_id: Any = None, manager_telegram_id: Any = None, tatyana_message_id: Any = None) -> None:
@@ -667,15 +678,52 @@ def is_new_payment_status(status: Any) -> bool:
     return str(status or "").strip() in ["Новая", "На оплату"]
 
 
-def admin_keyboard(payment_id: str, status: str) -> Optional[InlineKeyboardMarkup]:
-    if is_new_payment_status(status):
+def effective_payment_status_for_actions(
+    status: Any,
+    payment_status: Any = "",
+    money_status: Any = "",
+) -> str:
+    """v230: independent payment columns are the source of truth for Telegram buttons.
+
+    Apps Script may keep the public legacy `status` as "Новая/На оплату" while the
+    new independent column `paymentStatus` is already "Оплачено". Earlier bot code
+    looked only at `status`, so admin cards could stay forever on
+    "Ставлю действие в единую очередь…" even though the website already showed paid.
+    """
+    public_status = str(status or "").strip()
+    pay_status = str(payment_status or "").strip()
+    cash_status = str(money_status or "").strip()
+
+    if public_status in ["Отменено", "Отклонено"]:
+        return public_status
+    if cash_status == "Деньги в кассе" or public_status == "Деньги в кассе":
+        return "Деньги в кассе"
+    if pay_status == "Оплачено" or public_status == "Оплачено":
+        return "Оплачено"
+    if pay_status in ["Новая", "На оплату"]:
+        return pay_status
+    return public_status or "Новая"
+
+
+def effective_payment_status_from_request(request: Optional[Dict[str, Any]]) -> str:
+    request = request or {}
+    return effective_payment_status_for_actions(
+        request.get("status"),
+        request.get("paymentStatus"),
+        request.get("moneyStatus"),
+    )
+
+
+def admin_keyboard(payment_id: str, status: str, payment_status: Any = "", money_status: Any = "") -> Optional[InlineKeyboardMarkup]:
+    effective_status = effective_payment_status_for_actions(status, payment_status, money_status)
+    if is_new_payment_status(effective_status):
         return InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Оплачено", callback_data=f"admin:paid:{payment_id}"),
                 InlineKeyboardButton("❌ Отклонить", callback_data=f"admin:reject:{payment_id}"),
             ]
         ])
-    if status == "Оплачено":
+    if effective_status == "Оплачено":
         return InlineKeyboardMarkup([[InlineKeyboardButton("💰 Деньги в кассе", callback_data=f"admin:cashin:{payment_id}")]])
     return None
 
@@ -868,6 +916,22 @@ async def ensure_bound(update: Update, context: ContextTypes.DEFAULT_TYPE, force
         return None
 
 
+def keyboard_for_chat(update: Update):
+    try:
+        if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
+            return ADMIN_KEYBOARD
+    except Exception:
+        pass
+    return MAIN_KEYBOARD
+
+
+def is_admin_chat_update(update: Update) -> bool:
+    try:
+        return bool(update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID))
+    except Exception:
+        return False
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return ConversationHandler.END
@@ -877,7 +941,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cached:
         await update.message.reply_text(
             f"✅ Аккаунт найден: {cached.get('name', 'менеджер')}\nГлавное меню:",
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=keyboard_for_chat(update),
         )
         return ConversationHandler.END
 
@@ -888,13 +952,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user:
             schedule_flow_refresh(telegram_id)
             await safe_edit_text(progress_msg, f"✅ Аккаунт найден: {user.get('name', 'менеджер')}")
-            await update.message.reply_text("Главное меню:", reply_markup=MAIN_KEYBOARD)
+            await update.message.reply_text("Главное меню:", reply_markup=keyboard_for_chat(update))
             return ConversationHandler.END
 
         await safe_edit_text(progress_msg, "Telegram пока не привязан к аккаунту менеджера.")
         await update.message.reply_text(
             "Нажми «Привязать аккаунт» и введи телефон + PIN от сайта.",
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=keyboard_for_chat(update),
         )
         return ConversationHandler.END
     except Exception as err:
@@ -902,7 +966,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"Проверка зависла или не ответила: {err}\n\n"
             "Попробуй ещё раз /start или нажми «Привязать аккаунт».",
-            reply_markup=MAIN_KEYBOARD,
+            reply_markup=keyboard_for_chat(update),
         )
         return ConversationHandler.END
 
@@ -1346,12 +1410,12 @@ async def my_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     progress_msg = await update.message.reply_text("⏳ Загружаю заявки…")
     try:
         result = await api_async("list_my_requests", {"telegramId": update.effective_user.id}, timeout=45)
-        requests_list = [r for r in result.get("requests", []) if is_active_request_for_manager(r)][:10]
+        requests_list = [r for r in result.get("requests", []) if is_active_request_for_manager(r)][:30]
         if not requests_list:
             await safe_edit_text(progress_msg, "Заявок пока нет.")
             await update.message.reply_text("Главное меню:", reply_markup=MAIN_KEYBOARD)
             return
-        await safe_edit_text(progress_msg, f"Найдено заявок: {len(requests_list)}")
+        await safe_edit_text(progress_msg, f"Найдено активных заявок: {len(requests_list)}")
         for req in requests_list:
             await update.message.reply_html(payment_text(req), reply_markup=manager_keyboard(req.get("paymentId"), req.get("status")))
     except Exception as err:
@@ -1368,16 +1432,21 @@ async def fetch_payment_request(payment_id: Any, timeout: int = 25) -> Optional[
         return None
 
 
-def admin_status_reached(expected_status: str, actual_status: str) -> bool:
-    actual = str(actual_status or "")
+def admin_status_reached(
+    expected_status: str,
+    actual_status: str,
+    payment_status: Any = "",
+    money_status: Any = "",
+) -> bool:
+    effective = effective_payment_status_for_actions(actual_status, payment_status, money_status)
     expected = str(expected_status or "")
     if expected == "Оплачено":
-        return actual in ["Оплачено", "Деньги в кассе"]
+        return effective in ["Оплачено", "Деньги в кассе"]
     if expected == "Деньги в кассе":
-        return actual == "Деньги в кассе"
+        return effective == "Деньги в кассе"
     if expected == "Отклонено":
-        return actual == "Отклонено"
-    return actual == expected
+        return effective == "Отклонено"
+    return effective == expected
 
 
 async def set_manager_status_processing(context: ContextTypes.DEFAULT_TYPE, request: Optional[Dict[str, Any]]) -> None:
@@ -1405,7 +1474,12 @@ async def recover_admin_update_after_timeout(payment_id: Any, expected_status: s
     for _ in range(max(1, attempts)):
         await asyncio.sleep(3)
         request = await fetch_payment_request(payment_id, timeout=30)
-        if request and admin_status_reached(expected_status, request.get("status")):
+        if request and admin_status_reached(
+            expected_status,
+            request.get("status"),
+            request.get("paymentStatus"),
+            request.get("moneyStatus"),
+        ):
             return request
     return None
 
@@ -1440,7 +1514,12 @@ async def apply_admin_status_result(
             await admin_message.edit_text(
                 payment_text(request, "🧾 Заявка обновлена"),
                 parse_mode="HTML",
-                reply_markup=admin_keyboard(payment_id, request.get("status")),
+                reply_markup=admin_keyboard(
+                    payment_id,
+                    request.get("status"),
+                    request.get("paymentStatus"),
+                    request.get("moneyStatus"),
+                ),
             )
         except Exception:
             pass
@@ -1478,7 +1557,7 @@ async def apply_admin_status_result(
 
     async def _mark_status_synced_background():
         try:
-            await api_async("mark_status_synced", {"paymentId": payment_id, "status": processed_status or request.get("status")}, timeout=30)
+            await api_async("mark_status_synced", {"paymentId": payment_id, "status": processed_status or effective_payment_status_from_request(request)}, timeout=30)
         except Exception as err:
             print(f"mark_status_synced background failed for {payment_id}: {err}")
 
@@ -1509,8 +1588,55 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
             {"paymentId": payment_id, "action": status, "status": status, "comment": "Telegram"},
             timeout=45,
         )
-        request = result.get("request", {})
-        await apply_admin_status_result(context, query.message, payment_id, request, processed_status=request.get("status") or status)
+        request = result.get("request", {}) or {}
+
+        # v230: queue endpoints can return before the visible legacy `status` catches up.
+        # If we already have the independent column, render immediately. Otherwise do a
+        # very short verification, then still remove the intermediate text instead of
+        # leaving the admin card stuck forever.
+        if not request or not admin_status_reached(
+            status,
+            request.get("status"),
+            request.get("paymentStatus"),
+            request.get("moneyStatus"),
+        ):
+            verified = await recover_admin_update_after_timeout(payment_id, status, attempts=2)
+            if verified:
+                request = verified
+
+        if request:
+            if status == "Оплачено" and not admin_status_reached(
+                status,
+                request.get("status"),
+                request.get("paymentStatus"),
+                request.get("moneyStatus"),
+            ):
+                request = dict(request)
+                request["paymentStatus"] = "Оплачено"
+            elif status == "Деньги в кассе" and not admin_status_reached(
+                status,
+                request.get("status"),
+                request.get("paymentStatus"),
+                request.get("moneyStatus"),
+            ):
+                request = dict(request)
+                request["moneyStatus"] = "Деньги в кассе"
+            elif status == "Отклонено" and not admin_status_reached(
+                status,
+                request.get("status"),
+                request.get("paymentStatus"),
+                request.get("moneyStatus"),
+            ):
+                request = dict(request)
+                request["status"] = "Отклонено"
+            await apply_admin_status_result(context, query.message, payment_id, request, processed_status=status)
+        else:
+            await safe_edit_text(
+                query.message,
+                old_text + "\n\n✅ Действие поставлено в очередь. Обновлю карточку фоновой синхронизацией.",
+                parse_mode="HTML",
+                reply_markup=None,
+            )
     except Exception as err:
         # Apps Script мог успеть записать статус, но не успеть вернуть ответ.
         # Проверяем факт изменения, но не держим кнопку в вечном "ничего не происходит".
@@ -1592,7 +1718,12 @@ async def edit_payment_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             message_id=int(message_id),
             text=payment_text(request, title),
             parse_mode="HTML",
-            reply_markup=admin_keyboard(request.get("paymentId"), request.get("status")) if is_admin else manager_keyboard(request.get("paymentId"), request.get("status")),
+            reply_markup=admin_keyboard(
+                request.get("paymentId"),
+                request.get("status"),
+                request.get("paymentStatus"),
+                request.get("moneyStatus"),
+            ) if is_admin else manager_keyboard(request.get("paymentId"), request.get("status")),
         )
         return True
     except Exception:
@@ -1641,7 +1772,7 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
 
             if processed_ok:
                 try:
-                    await api_async("mark_status_synced", {"paymentId": payment_id, "status": request.get("status")}, timeout=30)
+                    await api_async("mark_status_synced", {"paymentId": payment_id, "status": effective_payment_status_from_request(request)}, timeout=30)
                 except Exception as err:
                     print(f"mark_status_synced failed for {payment_id}: {err}")
             else:
@@ -1650,19 +1781,50 @@ async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
         print(f"poll_status_updates error: {err}")
 
 
-async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        # v207: не блокируем Telegram callbacks синхронным requests.post.
+async def publish_unnotified_site_requests_now(context: ContextTypes.DEFAULT_TYPE, max_rounds: int = 1, per_round_limit: int = BOT_POLL_BATCH_LIMIT) -> Dict[str, Any]:
+    """Publish unnotified site-created requests to Telegram.
+
+    v232: the same logic is used by background polling and by the admin button
+    "Актуализировать заявки". We intentionally do several small rounds for the
+    manual button, because old rows without Telegram message IDs can otherwise
+    block newer ones until the next scheduled poll.
+    """
+    published = 0
+    scanned = 0
+    seen = set()
+    rounds = max(1, int(max_rounds or 1))
+    limit = max(1, int(per_round_limit or BOT_POLL_BATCH_LIMIT))
+
+    for _ in range(rounds):
         result = await api_async("list_unnotified", {}, timeout=45)
-        for request in (result.get("requests", []) or [])[:BOT_POLL_BATCH_LIMIT]:
+        requests = (result.get("requests", []) or [])[:limit]
+        if not requests:
+            break
+
+        round_published = 0
+        for request in requests:
             payment_id = request.get("paymentId")
+            if not payment_id:
+                continue
+            pid_key = str(payment_id)
+            if pid_key in seen:
+                continue
+            seen.add(pid_key)
+            scanned += 1
+
             if is_recently_published(payment_id):
                 continue
+
             admin_msg = await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=payment_text(request, "🧾 Новая заявка с сайта"),
                 parse_mode="HTML",
-                reply_markup=admin_keyboard(payment_id, request.get("status")),
+                reply_markup=admin_keyboard(
+                    payment_id,
+                    request.get("status"),
+                    request.get("paymentStatus"),
+                    request.get("moneyStatus"),
+                ),
             )
             manager_msg_id = ""
             manager_tg = request.get("telegramId")
@@ -1677,6 +1839,7 @@ async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
                     manager_msg_id = manager_msg.message_id
                 except Exception:
                     manager_msg_id = ""
+
             tatyana_msg_id = ""
             if should_notify_tatyana(request):
                 tatyana_ids = await sync_tatyana_payment_message(context, request, "🧾 Новая заявка по счету")
@@ -1684,6 +1847,8 @@ async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
 
             remember_recently_published(payment_id)
             remember_payment_messages(payment_id, admin_msg.message_id, manager_msg_id, manager_tg, tatyana_msg_id)
+            published += 1
+            round_published += 1
 
             async def _save_ids(pid=payment_id, aid=admin_msg.message_id, mid=manager_msg_id, tid=tatyana_msg_id):
                 await mark_notified_retry(pid, admin_message_id=aid, manager_message_id=mid, tatyana_message_id=tid)
@@ -1691,8 +1856,46 @@ async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
                 asyncio.create_task(_save_ids())
             except RuntimeError:
                 pass
+
+        # If this round did not publish anything, repeating immediately will likely
+        # return the same still-saving rows. The normal background loop will try again.
+        if round_published == 0:
+            break
+        await asyncio.sleep(0.4)
+
+    return {"published": published, "scanned": scanned}
+
+
+async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await publish_unnotified_site_requests_now(context, max_rounds=1, per_round_limit=BOT_POLL_BATCH_LIMIT)
     except Exception as err:
         print(f"poll_site_requests error: {err}")
+
+
+async def refresh_admin_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin_chat_update(update):
+        if update.message:
+            await update.message.reply_text("Эта кнопка работает только в админском чате.", reply_markup=MAIN_KEYBOARD)
+        return
+
+    if not update.message:
+        return
+
+    progress_msg = await update.message.reply_text("🔄 Актуализирую заявки…")
+    try:
+        result = await publish_unnotified_site_requests_now(context, max_rounds=6, per_round_limit=BOT_POLL_BATCH_LIMIT)
+        # Заодно дёргаем обновление статусов, чтобы зависшие карточки быстрее догнали сайт.
+        await poll_status_updates(context)
+        published = int(result.get("published") or 0)
+        scanned = int(result.get("scanned") or 0)
+        await safe_edit_text(
+            progress_msg,
+            f"✅ Актуализация завершена. Подтянуто новых заявок: {published}. Проверено: {scanned}.",
+        )
+        await update.message.reply_text("Админское меню:", reply_markup=ADMIN_KEYBOARD)
+    except Exception as err:
+        await safe_edit_text(progress_msg, f"⚠️ Не удалось актуализировать заявки: {err}")
 
 
 async def bot_background_loop(application, worker, name: str, first: int, interval: int):
@@ -1764,6 +1967,8 @@ def main():
 
     app.add_handler(bind_conversation)
     app.add_handler(request_conversation)
+    app.add_handler(MessageHandler(filters.Regex("^Актуализировать заявки$"), refresh_admin_requests))
+    app.add_handler(CommandHandler("refresh_requests", refresh_admin_requests))
     app.add_handler(MessageHandler(filters.Regex("^Мои заявки$"), my_requests))
     app.add_handler(MessageHandler(filters.Regex("^Отменить$"), cancel))
     app.add_handler(CallbackQueryHandler(handle_admin_action, pattern="^admin:"))
