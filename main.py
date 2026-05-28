@@ -2783,6 +2783,7 @@ async def _edit_admin_message_strict_v247(context: ContextTypes.DEFAULT_TYPE, me
     except Exception as err:
         return False, str(err)
 
+
 async def admin_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return
@@ -2792,37 +2793,41 @@ async def admin_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     limit = 25
     if context.args:
         try:
-            limit = max(1, min(int(context.args[0]), 100))
+            limit = max(1, min(int(context.args[0]), 80))
         except Exception:
             limit = 25
     try:
-        result = await asyncio.wait_for(api_async("list_admin_repair_candidates", {"limit": limit}, timeout=10), timeout=12)
-        requests_list = result.get("requests", []) or []
+        result = await asyncio.wait_for(
+            api_async("audit_admin_repair_candidates_v250", {"limit": limit}, timeout=8),
+            timeout=10,
+        )
         lines = []
-        for item in requests_list[:10]:
+        for item in (result.get("sample") or [])[:10]:
             lines.append(
-                "• {pid} · {mgr} · {date} · {status}/{pstatus} · adminID:{admin}".format(
+                "• {pid} · {mgr} · {date} · {status}/{pstatus} · {amount} · adminID:{admin}".format(
                     pid=item.get("paymentId") or "",
                     mgr=item.get("manager") or "",
                     date=item.get("eventDate") or "",
                     status=item.get("status") or "",
                     pstatus=item.get("paymentStatus") or "",
-                    admin="есть" if item.get("telegramAdminMessageId") else "нет",
+                    amount=fmt_money(item.get("amount") or 0),
+                    admin=item.get("adminMsg") or "нет",
                 )
             )
         sample = "\n" + "\n".join(lines) if lines else ""
         await update.message.reply_text(
-            "🔎 v247 audit админских карточек\n"
-            f"Проверяемый лимит: {result.get('requestedLimit')}\n"
+            "🔎 v250 быстрый аудит админских карточек\n"
+            f"Лимит: {result.get('requestedLimit')}\n"
             f"Активных заявок в выборке: {result.get('returned')}\n"
             f"С сохранённым Admin Message ID: {result.get('withAdminMessageId')}\n"
-            f"Без Admin Message ID: {result.get('missingAdminMessageId')}\n\n"
-            "Точный счёт зависших/удалённых карточек Telegram не отдаёт заранее. "
-            "Его покажет /admin_repair: edit=починили существующую карточку, new=старая карточка недоступна и создана новая."
+            f"Без Admin Message ID: {result.get('missingAdminMessageId')}\n"
+            f"Сервер собрал аудит за: {result.get('elapsedMs')} мс\n\n"
+            "Telegram не даёт заранее прочитать текст старых карточек. "
+            "Точный счёт зависших будет после /admin_repair: edited = старая карточка починена, new = старая недоступна и создана новая."
             f"{sample}"
         )
     except Exception as err:
-        await update.message.reply_text(f"⚠️ v247 admin_audit упал: {err}")
+        await update.message.reply_text(f"⚠️ v250 admin_audit упал: {err}")
 
 async def admin_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Repair admin cards without spamming: edit saved admin message first, create new only if edit fails."""
@@ -2831,20 +2836,23 @@ async def admin_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID)):
         await update.message.reply_text("Эта команда доступна только в админском чате.")
         return
-    limit = 25
+    limit = 15
     if context.args:
         try:
-            limit = max(1, min(int(context.args[0]), 100))
+            limit = max(1, min(int(context.args[0]), 40))
         except Exception:
-            limit = 25
-    progress = await update.message.reply_text(f"🔧 v247: проверяю и чиню до {limit} админских карточек…")
+            limit = 15
+    progress = await update.message.reply_text(f"🔧 v250: чиню до {limit} админских карточек маленьким батчем…")
     checked = edited = recreated = saved = failed = already_missing = 0
     details = []
     try:
-        result = await asyncio.wait_for(api_async("list_admin_repair_candidates", {"limit": limit}, timeout=10), timeout=12)
+        result = await asyncio.wait_for(
+            api_async("list_admin_repair_candidates_fast_v250", {"limit": limit}, timeout=8),
+            timeout=10,
+        )
         requests_list = result.get("requests", []) or []
         if not requests_list:
-            await progress.edit_text("✅ v247: сервер не вернул активных заявок для ремонта админских карточек.")
+            await progress.edit_text("✅ v250: сервер не вернул активных заявок для ремонта админских карточек.")
             return
         for request in requests_list:
             checked += 1
@@ -2881,10 +2889,10 @@ async def admin_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     admin_msg_id = str(msg.message_id)
                     recreated += 1
                     if edit_err:
-                        details.append(f"{payment_id}: новая карточка, старая не редактировалась ({edit_err[:90]})")
+                        details.append(f"{payment_id}: новая карточка ({edit_err[:90]})")
                 except Exception as send_err:
                     failed += 1
-                    details.append(f"{payment_id}: не удалось ни edit, ни send: {str(send_err)[:120]}")
+                    details.append(f"{payment_id}: не удалось edit/send: {str(send_err)[:120]}")
                     continue
             try:
                 await asyncio.wait_for(api_async("mark_notified", {
@@ -2899,7 +2907,7 @@ async def admin_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 details.append(f"{payment_id}: карточка есть, но ID не сохранился: {str(save_err)[:120]}")
         tail = ("\n\nДетали:\n" + "\n".join(details[:10])) if details else ""
         await progress.edit_text(
-            "✅ v247 admin_repair завершён.\n"
+            "✅ v250 admin_repair завершён.\n"
             f"Проверено заявок: {checked}\n"
             f"Отредактировано существующих карточек: {edited}\n"
             f"Создано новых только вместо недоступных/пустых: {recreated}\n"
@@ -2910,13 +2918,17 @@ async def admin_repair(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as err:
         try:
-            await progress.edit_text(f"⚠️ v247 admin_repair упал: {err}")
+            await progress.edit_text(f"⚠️ v250 admin_repair упал: {err}")
         except Exception:
-            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ v247 admin_repair упал: {err}")
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ v250 admin_repair упал: {err}")
 
-# v247: keep old command name but make it safe repair instead of duplicate resend.
+# v250: keep old command names but route to safe repair/audit.
 async def admin_backfill(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await admin_repair(update, context)
+
+async def admin_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text("/admin_last отключён, чтобы не плодить дубли. Используйте /admin_audit 25 и /admin_repair 15.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
@@ -2956,9 +2968,9 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("/health доступен только в админском чате.")
         return
     text = (
-        "✅ v248 жив. Админская доставка включена.\n"
+        "✅ v250 жив. Админская доставка включена.\n"
         "/admin_audit N — аудит сохранённых админских карточек\n"
-        "/admin_repair N — починить старые карточки без дублей\n"
+        "/admin_repair N — починить старые карточки без дублей маленьким батчем\n"
         "\n"
         f"ADMIN_CHAT_ID: {ADMIN_CHAT_ID}\n"
         f"APPS_SCRIPT_URL: {'есть' if APPS_SCRIPT_URL else 'нет'}\n"
@@ -3002,7 +3014,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def post_init(application):
-    await notify_admin_v238(application, "✅ Contrast Finance Bot v248 запущен. /admin_audit 25 — аудит, /admin_repair 25 — ремонт без дублей.")
+    await notify_admin_v238(application, "✅ Contrast Finance Bot v250 запущен. /admin_audit 25 — быстрый аудит, /admin_repair 15 — ремонт без дублей.")
     application.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests_v248", 3, POLL_SITE_REQUESTS_SECONDS))
     application.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates_v248", 8, POLL_SITE_REQUESTS_SECONDS))
 
