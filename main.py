@@ -912,18 +912,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return ConversationHandler.END
 
-    # v237: аварийно безопасная ветка для админского чата.
-    # Не запускаем менеджерскую проверку me_fast и не показываем кнопку ручной актуализации,
-    # потому что версии v232-v236 могли подвесить polling/background loop.
-    if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
-        await update.message.reply_text(
-            "✅ Админский чат активен.\n"
-            "Новые заявки и статусы подтягиваются фоновым polling.\n"
-            "Кнопку «Актуализировать заявки» временно отключил, чтобы она не подвешивала бота.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return ConversationHandler.END
-
     telegram_id = update.effective_user.id
     cached = get_cached_bound_user(telegram_id, context)
     if cached:
@@ -1850,20 +1838,218 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
+# ===== v238 EMERGENCY BOT DIAGNOSTICS + SAFE POLLING =====
+# База: v231. Цель: вернуть жизнь polling и дать видимый сигнал старта/ошибок.
+_ORIGINAL_START_V238 = start
 
-async def admin_refresh_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # v237: старую клавиатуру Telegram может держать локально после v232-v236.
-    # Отвечаем быстро и убираем кнопку, не запускаем тяжёлый refresh.
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message is None:
+        return ConversationHandler.END
+    if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
+        await update.message.reply_text(
+            "✅ Админский чат активен.\n"
+            "Бот v238 запущен в аварийном режиме: заявки и статусы подтягиваются фоновым polling.\n"
+            "Команды: /health — проверить жив ли бот.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+    return await _ORIGINAL_START_V238(update, context)
+
+
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return
     if update.effective_chat and int(update.effective_chat.id) == int(ADMIN_CHAT_ID):
         await update.message.reply_text(
-            "⚠️ Ручную актуализацию временно отключил.\n"
-            "Бот снова работает через обычный фоновый polling; старую кнопку убираю из клавиатуры.",
+            "✅ v238 жив.\n"
+            f"ADMIN_CHAT_ID: {ADMIN_CHAT_ID}\n"
+            f"APPS_SCRIPT_URL: {'есть' if APPS_SCRIPT_URL else 'нет'}\n"
+            f"BOT_API_SECRET: {'есть' if BOT_API_SECRET else 'нет'}\n"
+            f"POLL_SITE_REQUESTS_SECONDS: {POLL_SITE_REQUESTS_SECONDS}\n"
+            f"BOT_POLL_BATCH_LIMIT: {BOT_POLL_BATCH_LIMIT}",
             reply_markup=ReplyKeyboardRemove(),
         )
     else:
-        await update.message.reply_text("Эта кнопка доступна только в админском чате.", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text("Бот работает.", reply_markup=MAIN_KEYBOARD)
+
+
+async def notify_admin_v238(application, text: str):
+    try:
+        if ADMIN_CHAT_ID:
+            await application.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text)
+    except Exception as err:
+        print(f"v238 admin notify failed: {err}")
+
+
+async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        result = await api_async("list_unnotified", {}, timeout=20)
+        requests_list = (result.get("requests", []) or [])[:BOT_POLL_BATCH_LIMIT]
+        if not requests_list:
+            return
+        print(f"v238 poll_site_requests: {len(requests_list)} request(s)")
+        for request in requests_list:
+            payment_id = request.get("paymentId")
+            if not payment_id or is_recently_published(payment_id):
+                continue
+
+            admin_msg_id = ""
+            manager_msg_id = ""
+            tatyana_msg_id = ""
+            manager_tg = request.get("telegramId")
+
+            try:
+                admin_msg = await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=payment_text(request, "🧾 Новая заявка с сайта"),
+                    parse_mode="HTML",
+                    reply_markup=admin_keyboard(
+                        payment_id,
+                        request.get("status"),
+                        request.get("paymentStatus"),
+                        request.get("moneyStatus"),
+                    ),
+                    read_timeout=10,
+                    write_timeout=10,
+                    connect_timeout=10,
+                )
+                admin_msg_id = admin_msg.message_id
+            except Exception as err:
+                print(f"v238 admin send failed for {payment_id}: {err}")
+
+            if manager_tg:
+                try:
+                    manager_msg = await context.bot.send_message(
+                        chat_id=int(manager_tg),
+                        text=payment_text(request, "🧾 Заявка создана на сайте"),
+                        parse_mode="HTML",
+                        reply_markup=manager_keyboard(payment_id, request.get("status")),
+                        read_timeout=10,
+                        write_timeout=10,
+                        connect_timeout=10,
+                    )
+                    manager_msg_id = manager_msg.message_id
+                except Exception as err:
+                    print(f"v238 manager send failed for {payment_id}: {err}")
+
+            if should_notify_tatyana(request):
+                try:
+                    tatyana_ids = await sync_tatyana_payment_message(context, request, "🧾 Новая заявка по счету")
+                    tatyana_msg_id = tatyana_ids[0] if tatyana_ids else ""
+                except Exception as err:
+                    print(f"v238 tatyana send failed for {payment_id}: {err}")
+
+            # Если хотя бы кому-то отправили карточку — запоминаем и помечаем уведомлённой.
+            if admin_msg_id or manager_msg_id or tatyana_msg_id:
+                remember_recently_published(payment_id)
+                remember_payment_messages(payment_id, admin_msg_id, manager_msg_id, manager_tg, tatyana_msg_id)
+                try:
+                    await api_async("mark_notified", {
+                        "paymentId": payment_id,
+                        "adminMessageId": admin_msg_id,
+                        "managerMessageId": manager_msg_id,
+                        "tatyanaMessageId": tatyana_msg_id,
+                    }, timeout=20)
+                except Exception as err:
+                    print(f"v238 mark_notified failed for {payment_id}: {err}")
+            else:
+                print(f"v238 no messages sent for {payment_id}; will retry later")
+    except Exception as err:
+        print(f"v238 poll_site_requests error: {err}")
+        try:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ v238 ошибка подтяжки новых заявок: {err}")
+        except Exception:
+            pass
+
+
+async def poll_status_updates(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        result = await api_async("list_status_updates", {}, timeout=20)
+        requests_list = (result.get("requests", []) or [])[:BOT_POLL_BATCH_LIMIT]
+        if not requests_list:
+            return
+        print(f"v238 poll_status_updates: {len(requests_list)} update(s)")
+        for request in requests_list:
+            payment_id = request.get("paymentId")
+            cached = PAYMENT_MESSAGE_CACHE.get(str(payment_id or ""), {})
+            admin_ids = unique_int_ids(request.get("telegramAdminMessageId"), cached.get("admin_message_id"), cached.get("admin_message_ids"))
+            manager_ids = unique_int_ids(request.get("telegramManagerMessageId"), cached.get("manager_message_id"), cached.get("manager_message_ids"))
+            tatyana_ids = unique_int_ids(request.get("telegramTatyanaMessageId"), cached.get("tatyana_message_id"), cached.get("tatyana_message_ids"))
+            manager_tg = request.get("telegramId") or cached.get("manager_telegram_id")
+            any_done = False
+
+            if is_cashbox_archived(request):
+                try:
+                    any_done = bool(await remove_archived_payment_messages(
+                        context,
+                        request,
+                        admin_message_id=admin_ids,
+                        manager_message_id=manager_ids,
+                        manager_telegram_id=manager_tg,
+                    ))
+                except Exception as err:
+                    print(f"v238 archive remove failed for {payment_id}: {err}")
+            else:
+                remember_payment_messages(payment_id, admin_ids, manager_ids, manager_tg, tatyana_ids)
+                for aid in admin_ids:
+                    try:
+                        any_done = (await edit_payment_message(context, ADMIN_CHAT_ID, aid, request, "🧾 Заявка обновлена", is_admin=True)) or any_done
+                    except Exception as err:
+                        print(f"v238 admin edit failed for {payment_id}/{aid}: {err}")
+                if manager_tg:
+                    for mid in manager_ids:
+                        try:
+                            any_done = (await edit_payment_message(context, int(manager_tg), mid, request, "🔔 Статус заявки обновлён", is_admin=False)) or any_done
+                        except Exception as err:
+                            print(f"v238 manager edit failed for {payment_id}/{mid}: {err}")
+                if should_notify_tatyana(request):
+                    try:
+                        tatyana_after = await sync_tatyana_payment_message(context, request, "🧾 Заявка по счету обновлена", tatyana_ids)
+                        any_done = bool(tatyana_after) or any_done
+                    except Exception as err:
+                        print(f"v238 tatyana edit failed for {payment_id}: {err}")
+
+            # Важно: если карточки уже не редактируются, всё равно не держим статус в вечном pending.
+            try:
+                await api_async("mark_status_synced", {"paymentId": payment_id, "status": effective_payment_status_from_request(request)}, timeout=20)
+            except Exception as err:
+                print(f"v238 mark_status_synced failed for {payment_id}: {err}")
+    except Exception as err:
+        print(f"v238 poll_status_updates error: {err}")
+        try:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ v238 ошибка обновления статусов: {err}")
+        except Exception:
+            pass
+
+
+async def bot_background_loop(application, worker, name: str, first: int, interval: int):
+    await asyncio.sleep(max(0, first))
+    context = SimpleNamespace(bot=application.bot)
+    while True:
+        started = time.time()
+        try:
+            await worker(context)
+        except Exception as err:
+            print(f"v238 {name} background error: {err}")
+            await notify_admin_v238(application, f"⚠️ v238 {name} упал: {err}")
+        spent = time.time() - started
+        await asyncio.sleep(max(5, interval - int(spent)))
+
+
+async def post_init(application):
+    await notify_admin_v238(application, "✅ Contrast Finance Bot v238 запущен. Polling активен. /health — диагностика.")
+    asyncio.create_task(bot_background_loop(application, poll_site_requests, "poll_site_requests", 5, POLL_SITE_REQUESTS_SECONDS))
+    asyncio.create_task(bot_background_loop(application, poll_status_updates, "poll_status_updates", 10, POLL_SITE_REQUESTS_SECONDS))
+
+
+async def error_handler_v238(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    print(f"v238 Telegram handler error: {err}")
+    try:
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ v238 ошибка обработчика Telegram: {err}")
+    except Exception:
+        pass
+
 
 def main():
     require_env()
@@ -1904,15 +2090,15 @@ def main():
 
     app.add_handler(bind_conversation)
     app.add_handler(request_conversation)
-    app.add_handler(MessageHandler(filters.Regex("^Актуализировать заявки$"), admin_refresh_disabled))
-    app.add_handler(CommandHandler("refresh_requests", admin_refresh_disabled))
     app.add_handler(MessageHandler(filters.Regex("^Мои заявки$"), my_requests))
     app.add_handler(MessageHandler(filters.Regex("^Отменить$"), cancel))
     app.add_handler(CallbackQueryHandler(handle_admin_action, pattern="^admin:"))
     app.add_handler(CallbackQueryHandler(handle_manager_action, pattern="^manager:"))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("health", health))
+    app.add_error_handler(error_handler_v238)
 
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
