@@ -1,4 +1,4 @@
-# v235: Admin refresh is short-timeout/partial-safe; no 10-minute hangs.
+# v236: Admin refresh has hard 45s final report and immediate duplicate-click lock.
 # v230: Telegram admin buttons respect independent paymentStatus/moneyStatus and never leave
 # cards stuck on "Ставлю действие в единую очередь…" after the server already accepted the action.
 RECENTLY_PUBLISHED_PAYMENT_IDS = {}
@@ -50,6 +50,7 @@ BOT_POLL_BATCH_LIMIT = int(os.getenv("BOT_POLL_BATCH_LIMIT", "5"))
 TG_ACTION_TIMEOUT_SECONDS = int(os.getenv("TG_ACTION_TIMEOUT_SECONDS", "6"))
 ADMIN_REFRESH_API_TIMEOUT_SECONDS = int(os.getenv("ADMIN_REFRESH_API_TIMEOUT_SECONDS", "14"))
 ADMIN_REFRESH_RECENT_LIMIT = int(os.getenv("ADMIN_REFRESH_RECENT_LIMIT", "12"))
+ADMIN_REFRESH_TOTAL_TIMEOUT_SECONDS = int(os.getenv("ADMIN_REFRESH_TOTAL_TIMEOUT_SECONDS", "45"))
 
 (
     BIND_PHONE,
@@ -1976,85 +1977,103 @@ async def _run_step_with_timeout(label: str, coro, timeout_seconds: int) -> Dict
         return {"_label": label, "_timeout": False, "error": str(err)}
 
 
-async def _run_admin_refresh_background(context: ContextTypes.DEFAULT_TYPE, chat_id: int, progress_message_id: Optional[int] = None):
-    """v235: short, partial-safe admin refresh.
+async def _admin_refresh_core(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
+    """v236: bounded admin refresh core.
 
-    v234 moved the refresh to background, but the background job could still wait
-    for several slow Apps Script/Telegram calls in a row and look frozen for 10+
-    minutes. v235 does small passes with hard timeouts and reports partial results.
+    This core must either return a final report or raise within the external
+    ADMIN_REFRESH_TOTAL_TIMEOUT_SECONDS guard. It never owns the duplicate-run flag;
+    the handler sets that flag before creating the task, so repeated clicks are
+    blocked immediately.
     """
-    if context.bot_data.get("admin_refresh_in_progress"):
-        return
+    bot_context = SimpleNamespace(bot=context.bot)
 
-    context.bot_data["admin_refresh_in_progress"] = True
+    result = await _run_step_with_timeout(
+        "new",
+        publish_unnotified_site_requests_now(bot_context, max_rounds=1, per_round_limit=min(BOT_POLL_BATCH_LIMIT, 3)),
+        min(12, ADMIN_REFRESH_API_TIMEOUT_SECONDS),
+    )
+    status = await _run_step_with_timeout(
+        "status",
+        poll_status_updates(bot_context),
+        min(12, ADMIN_REFRESH_API_TIMEOUT_SECONDS),
+    )
+    recent = await _run_step_with_timeout(
+        "recent",
+        refresh_recent_payment_cards_now(bot_context, limit=ADMIN_REFRESH_RECENT_LIMIT),
+        min(18, ADMIN_REFRESH_API_TIMEOUT_SECONDS + 4),
+    )
+
+    published = int(result.get("published") or 0)
+    scanned = int(result.get("scanned") or 0)
+    repaired = int(recent.get("repaired") or 0)
+    recent_scanned = int(recent.get("scanned") or 0)
+    slow = [x.get("_label") for x in (result, status, recent) if x.get("_timeout")]
+    errors = [x.get("_label") for x in (result, status, recent) if x.get("error") and not x.get("_timeout")]
+
+    text = (
+        f"✅ Быстрая актуализация завершена. Новых заявок: {published}. "
+        f"Проверено новых: {scanned}. Обновлено карточек: {repaired}/{recent_scanned}."
+    )
+    if slow:
+        text += "\n⏱ Медленные шаги остановлены: " + ", ".join(slow) + ". Фоновый polling продолжит сам."
+    if errors:
+        text += "\n⚠️ Ошибки в шагах: " + ", ".join(errors) + "."
+    if published == 0 and repaired == 0 and not slow and not errors:
+        text += "\nℹ️ Сервер не вернул новых или отличающихся карточек. Если на сайте статус уже изменён, нажми кнопку статуса на конкретной карточке ещё раз или проверь Telegram Message ID в строке заявки."
+    return text
+
+
+async def _run_admin_refresh_background(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    progress_message_id: Optional[int] = None,
+    flag_already_set: bool = False,
+):
+    """v236: admin refresh cannot silently run forever.
+
+    v235 still allowed a silent background task failure and duplicate clicks because
+    the in-progress flag was set inside the scheduled task. v236 sets it in the
+    handler before scheduling and wraps the whole job in a hard timeout.
+    """
+    if not flag_already_set:
+        if context.bot_data.get("admin_refresh_in_progress"):
+            return
+        context.bot_data["admin_refresh_in_progress"] = True
+
     try:
-        bot_context = SimpleNamespace(bot=context.bot)
+        try:
+            text = await asyncio.wait_for(
+                _admin_refresh_core(context, chat_id),
+                timeout=max(15, int(ADMIN_REFRESH_TOTAL_TIMEOUT_SECONDS or 45)),
+            )
+        except asyncio.TimeoutError:
+            text = (
+                "⏱ Быстрая актуализация остановлена по таймауту. "
+                "Я не буду держать процесс бесконечно; фоновый polling продолжит догонять заявки. "
+                "Если конкретная карточка зависла, пришли Payment ID/скрин — починим точечно."
+            )
+        except Exception as err:
+            text = f"⚠️ Не удалось актуализировать заявки: {err}"
 
-        # Keep every step intentionally small. The normal polling continues to catch up.
-        result = await _run_step_with_timeout(
-            "new",
-            publish_unnotified_site_requests_now(bot_context, max_rounds=1, per_round_limit=min(BOT_POLL_BATCH_LIMIT, 3)),
-            ADMIN_REFRESH_API_TIMEOUT_SECONDS + 8,
-        )
-        status = await _run_step_with_timeout(
-            "status",
-            poll_status_updates(bot_context),
-            ADMIN_REFRESH_API_TIMEOUT_SECONDS + 8,
-        )
-        recent = await _run_step_with_timeout(
-            "recent",
-            refresh_recent_payment_cards_now(bot_context, limit=ADMIN_REFRESH_RECENT_LIMIT),
-            ADMIN_REFRESH_API_TIMEOUT_SECONDS + 20,
-        )
-
-        published = int(result.get("published") or 0)
-        scanned = int(result.get("scanned") or 0)
-        repaired = int(recent.get("repaired") or 0)
-        recent_scanned = int(recent.get("scanned") or 0)
-        slow = [x.get("_label") for x in (result, status, recent) if x.get("_timeout")]
-        errors = [x.get("_label") for x in (result, status, recent) if x.get("error") and not x.get("_timeout")]
-
-        text = (
-            f"✅ Быстрая актуализация завершена. Новых заявок: {published}. "
-            f"Проверено новых: {scanned}. Обновлено карточек: {repaired}/{recent_scanned}."
-        )
-        if slow:
-            text += "\n⏱ Медленные шаги пропущены: " + ", ".join(slow) + ". Фоновый polling продолжит сам."
-        if errors:
-            text += "\n⚠️ Ошибки в шагах: " + ", ".join(errors) + "."
-
+        delivered = False
         if progress_message_id:
             try:
                 await asyncio.wait_for(
                     context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text=text),
                     timeout=TG_ACTION_TIMEOUT_SECONDS,
                 )
-                return
+                delivered = True
             except Exception as err:
                 print(f"admin refresh final edit failed: {err}")
 
-        await asyncio.wait_for(
-            context.bot.send_message(chat_id=chat_id, text=text, reply_markup=ADMIN_KEYBOARD),
-            timeout=TG_ACTION_TIMEOUT_SECONDS,
-        )
-    except Exception as err:
-        text = f"⚠️ Не удалось актуализировать заявки: {err}"
-        if progress_message_id:
+        if not delivered:
             try:
                 await asyncio.wait_for(
-                    context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id, text=text),
+                    context.bot.send_message(chat_id=chat_id, text=text, reply_markup=ADMIN_KEYBOARD),
                     timeout=TG_ACTION_TIMEOUT_SECONDS,
                 )
-                return
-            except Exception as edit_err:
-                print(f"admin refresh error edit failed: {edit_err}")
-        try:
-            await asyncio.wait_for(
-                context.bot.send_message(chat_id=chat_id, text=text, reply_markup=ADMIN_KEYBOARD),
-                timeout=TG_ACTION_TIMEOUT_SECONDS,
-            )
-        except Exception as send_err:
-            print(f"admin refresh error send failed: {send_err}")
+            except Exception as send_err:
+                print(f"admin refresh final send failed: {send_err}")
     finally:
         context.bot_data["admin_refresh_in_progress"] = False
 
@@ -2072,20 +2091,41 @@ async def refresh_admin_requests(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("🔄 Актуализация уже запущена. Дождись финального сообщения.", reply_markup=ADMIN_KEYBOARD)
         return
 
-    progress_msg = await asyncio.wait_for(
-        update.message.reply_text(
-            "🔄 Запустил быструю актуализацию в фоне. Можно дальше пользоваться ботом.",
-            reply_markup=ADMIN_KEYBOARD,
-        ),
-        timeout=TG_ACTION_TIMEOUT_SECONDS,
-    )
-
+    # v236: block duplicate clicks immediately, before the background task has a
+    # chance to start. This fixes repeated refresh launches.
+    context.bot_data["admin_refresh_in_progress"] = True
     try:
-        asyncio.create_task(_run_admin_refresh_background(context, update.effective_chat.id, progress_msg.message_id))
-    except RuntimeError:
-        # Fallback for environments where create_task is unexpectedly unavailable.
-        await _run_admin_refresh_background(context, update.effective_chat.id, progress_msg.message_id)
+        progress_msg = await asyncio.wait_for(
+            update.message.reply_text(
+                "🔄 Запустил быструю актуализацию в фоне. Обычно это до 45 секунд. Можно дальше пользоваться ботом.",
+                reply_markup=ADMIN_KEYBOARD,
+            ),
+            timeout=TG_ACTION_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        context.bot_data["admin_refresh_in_progress"] = False
+        raise
 
+    task_coro = _run_admin_refresh_background(
+        context,
+        update.effective_chat.id,
+        progress_msg.message_id,
+        flag_already_set=True,
+    )
+    try:
+        # PTB Application.create_task keeps task exceptions visible in bot logs.
+        if getattr(context, "application", None):
+            context.application.create_task(task_coro)
+        else:
+            asyncio.create_task(task_coro)
+    except Exception as err:
+        print(f"admin refresh schedule failed, running inline: {err}")
+        await _run_admin_refresh_background(
+            context,
+            update.effective_chat.id,
+            progress_msg.message_id,
+            flag_already_set=True,
+        )
 
 async def bot_background_loop(application, worker, name: str, first: int, interval: int):
     await asyncio.sleep(max(0, first))
