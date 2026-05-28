@@ -936,6 +936,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None:
         return ConversationHandler.END
 
+    # v233: админский чат не должен проходить менеджерскую привязку.
+    # Раньше /start в админском чате показывал «Проверяю аккаунт…» и мог
+    # зависнуть на me_fast, потому что админ — не менеджер сайта.
+    if is_admin_chat_update(update) or int(update.effective_user.id) == int(ADMIN_CHAT_ID):
+        context.user_data.pop("bound_user", None)
+        await update.message.reply_text(
+            "Админское меню:",
+            reply_markup=ADMIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+
     telegram_id = update.effective_user.id
     cached = get_cached_bound_user(telegram_id, context)
     if cached:
@@ -1873,6 +1884,64 @@ async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
         print(f"poll_site_requests error: {err}")
 
 
+
+async def refresh_recent_payment_cards_now(context: ContextTypes.DEFAULT_TYPE, limit: int = 40) -> Dict[str, Any]:
+    """v233: force-edit recent Telegram cards from current Sheet state.
+
+    This is the repair path for old cards stuck on «Ставлю действие в единую очередь…»:
+    sometimes the Sheet already has paymentStatus/moneyStatus, but status sync did
+    not emit an update or the bot process restarted and lost local cache. We read
+    recent rows with Telegram message ids and redraw those cards directly.
+    """
+    repaired = 0
+    scanned = 0
+    try:
+        result = await api_async("list_recent_requests", {"limit": int(limit or 40)}, timeout=45)
+        requests = result.get("requests", []) or []
+    except Exception as err:
+        print(f"refresh_recent_payment_cards_now list_recent_requests failed: {err}")
+        return {"scanned": 0, "repaired": 0, "error": str(err)}
+
+    for request in requests:
+        payment_id = request.get("paymentId")
+        if not payment_id:
+            continue
+        scanned += 1
+        cached = PAYMENT_MESSAGE_CACHE.get(str(payment_id or ""), {})
+        admin_ids = unique_int_ids(request.get("telegramAdminMessageId"), cached.get("admin_message_id"), cached.get("admin_message_ids"))
+        manager_ids = unique_int_ids(request.get("telegramManagerMessageId"), cached.get("manager_message_id"), cached.get("manager_message_ids"))
+        tatyana_ids = unique_int_ids(request.get("telegramTatyanaMessageId"), cached.get("tatyana_message_id"), cached.get("tatyana_message_ids"))
+        manager_tg = request.get("telegramId") or cached.get("manager_telegram_id")
+
+        changed = False
+        if is_cashbox_archived(request):
+            changed = bool(await remove_archived_payment_messages(
+                context,
+                request,
+                admin_message_id=admin_ids,
+                manager_message_id=manager_ids,
+                manager_telegram_id=manager_tg,
+            ))
+        else:
+            remember_payment_messages(payment_id, admin_ids, manager_ids, manager_tg, tatyana_ids)
+            for aid in admin_ids:
+                changed = (await edit_payment_message(context, ADMIN_CHAT_ID, aid, request, "🧾 Заявка обновлена", is_admin=True)) or changed
+            if manager_tg:
+                for mid in manager_ids:
+                    changed = (await edit_payment_message(context, int(manager_tg), mid, request, "🔔 Статус заявки обновлён", is_admin=False)) or changed
+            if should_notify_tatyana(request):
+                tatyana_after = await sync_tatyana_payment_message(context, request, "🧾 Заявка по счету обновлена", tatyana_ids)
+                changed = bool(tatyana_after) or changed
+
+        if changed:
+            repaired += 1
+            try:
+                await api_async("mark_status_synced", {"paymentId": payment_id, "status": effective_payment_status_from_request(request)}, timeout=30)
+            except Exception as err:
+                print(f"mark_status_synced after recent refresh failed for {payment_id}: {err}")
+
+    return {"scanned": scanned, "repaired": repaired}
+
 async def refresh_admin_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin_chat_update(update):
         if update.message:
@@ -1884,14 +1953,18 @@ async def refresh_admin_requests(update: Update, context: ContextTypes.DEFAULT_T
 
     progress_msg = await update.message.reply_text("🔄 Актуализирую заявки…")
     try:
-        result = await publish_unnotified_site_requests_now(context, max_rounds=6, per_round_limit=BOT_POLL_BATCH_LIMIT)
+        result = await publish_unnotified_site_requests_now(context, max_rounds=8, per_round_limit=BOT_POLL_BATCH_LIMIT)
         # Заодно дёргаем обновление статусов, чтобы зависшие карточки быстрее догнали сайт.
         await poll_status_updates(context)
+        recent = await refresh_recent_payment_cards_now(context, limit=50)
         published = int(result.get("published") or 0)
         scanned = int(result.get("scanned") or 0)
+        repaired = int(recent.get("repaired") or 0)
+        recent_scanned = int(recent.get("scanned") or 0)
         await safe_edit_text(
             progress_msg,
-            f"✅ Актуализация завершена. Подтянуто новых заявок: {published}. Проверено: {scanned}.",
+            f"✅ Актуализация завершена. Новых заявок: {published}. "
+            f"Проверено новых: {scanned}. Обновлено карточек: {repaired}/{recent_scanned}.",
         )
         await update.message.reply_text("Админское меню:", reply_markup=ADMIN_KEYBOARD)
     except Exception as err:
@@ -1924,7 +1997,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message:
         track_update_message(update, context)
         await cleanup_payment_flow_messages(context, update.effective_chat.id)
-        await update.message.reply_text("Действие отменено.", reply_markup=MAIN_KEYBOARD)
+        await update.message.reply_text("Действие отменено.", reply_markup=keyboard_for_chat(update))
     return ConversationHandler.END
 
 
