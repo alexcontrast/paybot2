@@ -411,8 +411,12 @@ async def cleanup_payment_flow_messages(
 
 
 def is_cashbox_archived(request: Dict[str, Any]) -> bool:
-    """Telegram should remove terminal/archived request cards from chats."""
-    return (request.get("status") or "") in ["Деньги в кассе", "Отменено", "Отклонено"]
+    """Telegram should remove terminal/archived request cards from admin/manager chats.
+
+    Treat `moneyStatus = Деньги в кассе` as final even if the legacy public
+    `status` field still says `Оплачено`. Tatiana's copy is updated, not deleted.
+    """
+    return effective_request_status(request or {}) in ["Деньги в кассе", "Отменено", "Отклонено"]
 
 
 def remember_payment_messages(payment_id: Any, admin_message_id: Any = None, manager_message_id: Any = None, manager_telegram_id: Any = None, tatyana_message_id: Any = None) -> None:
@@ -667,15 +671,46 @@ def is_new_payment_status(status: Any) -> bool:
     return str(status or "").strip() in ["Новая", "На оплату"]
 
 
+def effective_request_status(request_or_status: Any, payment_status: Any = "", money_status: Any = "") -> str:
+    """Return the single effective status for Telegram display/actions.
+
+    The stable rollback still may receive legacy independent fields from Apps Script
+    (paymentStatus/moneyStatus). For Telegram, the final cash-in stage must imply
+    that payment is also completed: two green checks, then remove admin/manager cards.
+    """
+    if isinstance(request_or_status, dict):
+        status = str(request_or_status.get("status") or "").strip()
+        payment_status = str(request_or_status.get("paymentStatus") or "").strip()
+        money_status = str(request_or_status.get("moneyStatus") or "").strip()
+    else:
+        status = str(request_or_status or "").strip()
+        payment_status = str(payment_status or "").strip()
+        money_status = str(money_status or "").strip()
+
+    # Final stage wins. It also means the request was paid.
+    if status == "Деньги в кассе" or money_status == "Деньги в кассе":
+        return "Деньги в кассе"
+    if status in ["Отклонено", "Отменено"]:
+        return status
+    if payment_status in ["Отклонено", "Отменено"]:
+        return payment_status
+    if status == "Оплачено" or payment_status == "Оплачено":
+        return "Оплачено"
+    if is_new_payment_status(status) or is_new_payment_status(payment_status):
+        return "Новая"
+    return status or payment_status or "Новая"
+
+
 def admin_keyboard(payment_id: str, status: str) -> Optional[InlineKeyboardMarkup]:
-    if is_new_payment_status(status):
+    effective = effective_request_status(status)
+    if is_new_payment_status(effective):
         return InlineKeyboardMarkup([
             [
                 InlineKeyboardButton("✅ Оплачено", callback_data=f"admin:paid:{payment_id}"),
                 InlineKeyboardButton("❌ Отклонить", callback_data=f"admin:reject:{payment_id}"),
             ]
         ])
-    if status == "Оплачено":
+    if effective == "Оплачено":
         return InlineKeyboardMarkup([[InlineKeyboardButton("💰 Деньги в кассе", callback_data=f"admin:cashin:{payment_id}")]])
     return None
 
@@ -683,41 +718,40 @@ def admin_keyboard(payment_id: str, status: str) -> Optional[InlineKeyboardMarku
 def manager_keyboard(payment_id: str, status: str) -> Optional[InlineKeyboardMarkup]:
     # Apps Script/site may return the initial payment status either as "Новая"
     # or as the UI label "На оплату". Both are active and cancelable.
-    if is_new_payment_status(status):
+    effective = effective_request_status(status)
+    if is_new_payment_status(effective):
         return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отменить заявку", callback_data=f"manager:cancel:{payment_id}")]])
     return None
 
 
-def payment_status_label(status: str, payment_status: str = "") -> str:
-    normalized = payment_status or status or "Новая"
-    if normalized == "Новая":
+def payment_status_label(status: str, payment_status: str = "", money_status: str = "") -> str:
+    effective = effective_request_status(status, payment_status, money_status)
+    if effective == "Новая":
         return "🕒 На оплату"
-    if normalized == "Оплачено":
+    if effective in ["Оплачено", "Деньги в кассе"]:
         return "✅ Оплачено"
-    if normalized == "Деньги в кассе":
-        return "✅ Оплачено"
-    if normalized in ["Отменено", "Отклонено"]:
-        return "❌ Отменено" if normalized == "Отменено" else "❌ Отклонено"
-    return normalized
+    if effective in ["Отменено", "Отклонено"]:
+        return "❌ Отменено" if effective == "Отменено" else "❌ Отклонено"
+    return effective
 
 
 def money_status_label(status: str, money_status: str = "") -> str:
-    normalized = money_status or status or "Новая"
-    if normalized == "Деньги в кассе":
+    effective = effective_request_status(status, "", money_status)
+    if effective == "Деньги в кассе":
         return "✅ Деньги в кассе"
-    if normalized in ["Отменено", "Отклонено"]:
+    if effective in ["Отменено", "Отклонено"]:
         return ""
     return "💰 Ждем деньги"
 
 
 def is_active_request_for_manager(request: Dict[str, Any]) -> bool:
-    status = request.get("status") or "Новая"
-    return status in ["Новая", "Оплачено"]
+    effective = effective_request_status(request)
+    return effective in ["Новая", "Оплачено"]
 
 
 def payment_text(request: Dict[str, Any], title: str = "🧾 Заявка на оплату") -> str:
     status = request.get("status") or "Новая"
-    payment_status = payment_status_label(status, request.get("paymentStatus") or "")
+    payment_status = payment_status_label(status, request.get("paymentStatus") or "", request.get("moneyStatus") or "")
     money_status = money_status_label(status, request.get("moneyStatus") or "")
     card = request.get("cardNumber") or ""
     card_display = format_card_number_for_telegram(card)
@@ -1227,7 +1261,7 @@ async def publish_created_request_cards(update: Update, context: ContextTypes.DE
         chat_id=ADMIN_CHAT_ID,
         text=payment_text(request, "🧾 Новая заявка на оплату"),
         parse_mode="HTML",
-        reply_markup=admin_keyboard(payment_id, request.get("status")),
+        reply_markup=admin_keyboard(payment_id, effective_request_status(request)),
     )
 
     tatyana_msg_id = ""
@@ -1440,7 +1474,7 @@ async def apply_admin_status_result(
             await admin_message.edit_text(
                 payment_text(request, "🧾 Заявка обновлена"),
                 parse_mode="HTML",
-                reply_markup=admin_keyboard(payment_id, request.get("status")),
+                reply_markup=admin_keyboard(payment_id, effective_request_status(request)),
             )
         except Exception:
             pass
@@ -1641,7 +1675,7 @@ async def edit_payment_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             message_id=int(message_id),
             text=payment_text(request, title),
             parse_mode="HTML",
-            reply_markup=admin_keyboard(request.get("paymentId"), request.get("status")) if is_admin else manager_keyboard(request.get("paymentId"), request.get("status")),
+            reply_markup=admin_keyboard(request.get("paymentId"), effective_request_status(request)) if is_admin else manager_keyboard(request.get("paymentId"), effective_request_status(request)),
         )
         return True
     except Exception:
@@ -1711,7 +1745,7 @@ async def poll_site_requests(context: ContextTypes.DEFAULT_TYPE):
                 chat_id=ADMIN_CHAT_ID,
                 text=payment_text(request, "🧾 Новая заявка с сайта"),
                 parse_mode="HTML",
-                reply_markup=admin_keyboard(payment_id, request.get("status")),
+                reply_markup=admin_keyboard(payment_id, effective_request_status(request)),
             )
             manager_msg_id = ""
             manager_tg = request.get("telegramId")
