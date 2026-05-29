@@ -1497,34 +1497,83 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     _, action, payment_id = query.data.split(":", 2)
     status = {"paid": "Оплачено", "reject": "Отклонено", "cashin": "Деньги в кассе"}[action]
-    old_text = query.message.text_html or query.message.text or ""
+    action_label = {
+        "paid": "Фиксирую оплату",
+        "reject": "Отклоняю заявку",
+        "cashin": "Фиксирую деньги в кассе",
+    }.get(action, "Обновляю статус")
 
-    # v207: не делаем предварительный get_request перед сменой статуса.
-    # При большом потоке заявок этот лишний запрос блокировал кнопку админа на 20+ секунд.
-    await safe_edit_text(query.message, old_text + "\n\n⏳ Ставлю действие в единую очередь…", parse_mode="HTML")
+    lock_key = str(payment_id or "")
+    now = time.time()
+    existing_lock = PENDING_PROGRESS_BY_PAYMENT_ID.get(lock_key)
+    if existing_lock and now - float(existing_lock.get("ts", 0)) < 18:
+        await query.answer("Эта карточка уже обновляется. Дождитесь ответа сервера.", show_alert=True)
+        return
+
+    old_text = query.message.text_html or query.message.text or ""
+    old_markup = query.message.reply_markup
+    PENDING_PROGRESS_BY_PAYMENT_ID[lock_key] = {"ts": now, "old_text": old_text}
+
+    # Блокируем только эту карточку. Остальные карточки и бот остаются живыми.
+    await safe_edit_text(
+        query.message,
+        old_text + f"\n\n⏳ {action_label}…",
+        reply_markup=None,
+        parse_mode="HTML",
+    )
 
     try:
-        result = await api_async_try(
-            ["queue_payment_status_action", "admin_update_fast", "admin_update"],
-            {"paymentId": payment_id, "action": status, "status": status, "comment": "Telegram"},
-            timeout=45,
+        # Короткий лимит: если сервер не ответил быстро, возвращаем карточку как была.
+        # Если Apps Script всё-таки допишет статус позже, обычный polling list_status_updates догонит Telegram.
+        result = await asyncio.wait_for(
+            api_async_try(
+                ["queue_payment_status_action", "admin_update_fast", "admin_update"],
+                {"paymentId": payment_id, "action": status, "status": status, "comment": "Telegram"},
+                timeout=14,
+            ),
+            timeout=14,
         )
         request = result.get("request", {})
-        await apply_admin_status_result(context, query.message, payment_id, request, processed_status=request.get("status") or status)
-    except Exception as err:
-        # Apps Script мог успеть записать статус, но не успеть вернуть ответ.
-        # Проверяем факт изменения, но не держим кнопку в вечном "ничего не происходит".
-        recovered_request = await recover_admin_update_after_timeout(payment_id, status, attempts=3)
-        if recovered_request:
-            await apply_admin_status_result(context, query.message, payment_id, recovered_request, processed_status=status)
-            return
+        await apply_admin_status_result(
+            context,
+            query.message,
+            payment_id,
+            request,
+            processed_status=request.get("status") or status,
+        )
 
-        rollback_request = await fetch_payment_request(payment_id, timeout=20)
-        if rollback_request:
-            await apply_admin_status_result(context, query.message, payment_id, rollback_request, processed_status=rollback_request.get("status"))
+    except asyncio.TimeoutError:
+        # Проверяем один раз: иногда статус успел записаться, но ответ не вернулся.
+        request = await fetch_payment_request(payment_id, timeout=5)
+        if request and admin_status_reached(status, request.get("status")):
+            await apply_admin_status_result(context, query.message, payment_id, request, processed_status=status)
+            await query.answer("Статус записался, карточка обновлена.")
         else:
-            await safe_edit_text(query.message, old_text + f"\n\n⚠️ Не удалось обновить статус: {esc(err)}", parse_mode="HTML")
-        await query.answer(str(err), show_alert=True)
+            await safe_edit_text(
+                query.message,
+                old_text + "\n\n⚠️ Сервер не ответил за 14 секунд. Карточка возвращена как была. Если статус записался позже, бот обновит её через сверку.",
+                reply_markup=old_markup,
+                parse_mode="HTML",
+            )
+            await query.answer("Сервер не ответил. Карточка возвращена как была.", show_alert=True)
+
+    except Exception as err:
+        # Если сервер успел записать статус, покажем результат. Иначе откатываем конкретную карточку.
+        request = await fetch_payment_request(payment_id, timeout=6)
+        if request and admin_status_reached(status, request.get("status")):
+            await apply_admin_status_result(context, query.message, payment_id, request, processed_status=status)
+            await query.answer("Статус записался, карточка обновлена.")
+        else:
+            await safe_edit_text(
+                query.message,
+                old_text + f"\n\n⚠️ Не удалось обновить статус: {esc(err)}",
+                reply_markup=old_markup,
+                parse_mode="HTML",
+            )
+            await query.answer(str(err), show_alert=True)
+
+    finally:
+        PENDING_PROGRESS_BY_PAYMENT_ID.pop(lock_key, None)
 
 
 async def recover_cancel_after_timeout(telegram_id: Any, payment_id: Any, attempts: int = 6) -> bool:
