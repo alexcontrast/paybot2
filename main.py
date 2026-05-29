@@ -1541,7 +1541,7 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     lock_key = str(payment_id or "")
     now = time.time()
     existing_lock = PENDING_PROGRESS_BY_PAYMENT_ID.get(lock_key)
-    if existing_lock and now - float(existing_lock.get("ts", 0)) < 18:
+    if existing_lock and now - float(existing_lock.get("ts", 0)) < 35:
         await query.answer("Эта карточка уже обновляется. Дождитесь ответа сервера.", show_alert=True)
         return
 
@@ -1558,15 +1558,15 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
     try:
-        # Короткий лимит: если сервер не ответил быстро, возвращаем карточку как была.
+        # Лимит ожидания 30 секунд: даём Apps Script время записать статус, но не оставляем карточку висеть навсегда.
         # Если Apps Script всё-таки допишет статус позже, обычный polling list_status_updates догонит Telegram.
         result = await asyncio.wait_for(
             api_async_try(
                 ["admin_update"],
                 {"paymentId": payment_id, "status": status, "comment": "Telegram"},
-                timeout=14,
+                timeout=30,
             ),
-            timeout=14,
+            timeout=30,
         )
         request = result.get("request", {})
         await apply_admin_status_result(
@@ -1586,7 +1586,7 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await safe_edit_text(
                 query.message,
-                old_text + "\n\n⚠️ Сервер не ответил за 14 секунд. Карточка возвращена как была. Если статус записался позже, бот обновит её через сверку.",
+                old_text + "\n\n⚠️ Сервер не ответил за 30 секунд. Карточка возвращена как была. Если статус записался позже, бот обновит её через сверку.",
                 reply_markup=old_markup,
                 parse_mode="HTML",
             )
