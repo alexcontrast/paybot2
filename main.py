@@ -35,6 +35,7 @@ from telegram.ext import (
 # v167: cache binding after first successful check/bind; support flat and nested Apps Script API responses.
 # v161: speed layer — longer Railway cache, stale-while-revalidate, item prewarm, faster request endpoint.
 # v160: delete admin card too when a request is canceled/archived from the website; preserve all known Telegram message IDs.
+# stable direct status: Telegram admin buttons use direct admin_update, not queued preview, so Sheets status is written before card changes.
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 # v182: заявки "По счету" дублируются Татьяне как view-only копия.
@@ -1561,8 +1562,8 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Если Apps Script всё-таки допишет статус позже, обычный polling list_status_updates догонит Telegram.
         result = await asyncio.wait_for(
             api_async_try(
-                ["queue_payment_status_action", "admin_update_fast", "admin_update"],
-                {"paymentId": payment_id, "action": status, "status": status, "comment": "Telegram"},
+                ["admin_update"],
+                {"paymentId": payment_id, "status": status, "comment": "Telegram"},
                 timeout=14,
             ),
             timeout=14,
