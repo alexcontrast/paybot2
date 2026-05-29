@@ -1580,7 +1580,10 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     except asyncio.TimeoutError:
         # Проверяем один раз: иногда статус успел записаться, но ответ не вернулся.
         request = await fetch_payment_request(payment_id, timeout=5)
-        if request and admin_status_reached(status, request.get("status")):
+        if request and is_cashbox_archived(request):
+            await apply_admin_status_result(context, query.message, payment_id, request, processed_status=request.get("status") or status)
+            await query.answer("Заявка уже закрыта, карточка убрана.")
+        elif request and admin_status_reached(status, request.get("status")):
             await apply_admin_status_result(context, query.message, payment_id, request, processed_status=status)
             await query.answer("Статус записался, карточка обновлена.")
         else:
@@ -1595,7 +1598,10 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as err:
         # Если сервер успел записать статус, покажем результат. Иначе откатываем конкретную карточку.
         request = await fetch_payment_request(payment_id, timeout=6)
-        if request and admin_status_reached(status, request.get("status")):
+        if request and is_cashbox_archived(request):
+            await apply_admin_status_result(context, query.message, payment_id, request, processed_status=request.get("status") or status)
+            await query.answer("Заявка уже закрыта, карточка убрана.")
+        elif request and admin_status_reached(status, request.get("status")):
             await apply_admin_status_result(context, query.message, payment_id, request, processed_status=status)
             await query.answer("Статус записался, карточка обновлена.")
         else:
@@ -1645,18 +1651,58 @@ async def handle_manager_action(update: Update, context: ContextTypes.DEFAULT_TY
     _, action, payment_id = query.data.split(":", 2)
     if action != "cancel":
         return
+
     try:
         await query.edit_message_text("⏳ Отменяю заявку…")
-        await api_async("cancel_request", {"telegramId": query.from_user.id, "paymentId": payment_id}, timeout=90)
-        await remove_payment_messages_by_id(context, payment_id, manager_telegram_id=query.from_user.id)
-        await safe_delete_message(context, query.message.chat_id, query.message.message_id)
+        result = await api_async("cancel_request", {"telegramId": query.from_user.id, "paymentId": payment_id}, timeout=90)
+        request = result.get("request") or {}
+        if not request:
+            request = {"paymentId": payment_id, "status": "Отменено"}
+
+        request["paymentId"] = request.get("paymentId") or payment_id
+        request["status"] = request.get("status") or "Отменено"
+        request["telegramId"] = request.get("telegramId") or str(query.from_user.id)
+
+        # Удаляем карточки у админа и менеджера. Копию Татьяны не удаляем — только обновляем,
+        # если это заявка «по счету» и у неё есть сохранённый message id.
+        removed = await remove_archived_payment_messages(
+            context,
+            request,
+            admin_message_id=request.get("telegramAdminMessageId"),
+            manager_message_id=unique_int_ids(request.get("telegramManagerMessageId"), getattr(query.message, "message_id", None)),
+            manager_telegram_id=query.from_user.id,
+        )
+
+        # На случай если сервер старой версии не вернул Telegram ID — используем прежний fallback.
+        if not removed:
+            await remove_payment_messages_by_id(context, payment_id, manager_telegram_id=query.from_user.id)
+            await safe_delete_message(context, query.message.chat_id, query.message.message_id)
+
+        try:
+            await api_async("mark_status_synced", {"paymentId": payment_id, "status": "Отменено"}, timeout=30)
+        except Exception as err:
+            print(f"mark_status_synced after manager cancel failed for {payment_id}: {err}")
+
         await context.bot.send_message(chat_id=query.from_user.id, text="Заявка отменена.", reply_markup=MAIN_KEYBOARD)
     except requests.exceptions.Timeout:
         await query.edit_message_text("⏳ Google долго отвечает. Проверяю, отменилась ли заявка…")
         recovered = await recover_cancel_after_timeout(query.from_user.id, payment_id)
         if recovered:
-            await remove_payment_messages_by_id(context, payment_id, manager_telegram_id=query.from_user.id)
-            await safe_delete_message(context, query.message.chat_id, query.message.message_id)
+            try:
+                request = await fetch_payment_request(payment_id, timeout=20)
+            except Exception:
+                request = {"paymentId": payment_id, "status": "Отменено", "telegramId": str(query.from_user.id)}
+            await remove_archived_payment_messages(
+                context,
+                request or {"paymentId": payment_id, "status": "Отменено", "telegramId": str(query.from_user.id)},
+                admin_message_id=(request or {}).get("telegramAdminMessageId") if request else None,
+                manager_message_id=unique_int_ids((request or {}).get("telegramManagerMessageId") if request else None, getattr(query.message, "message_id", None)),
+                manager_telegram_id=query.from_user.id,
+            )
+            try:
+                await api_async("mark_status_synced", {"paymentId": payment_id, "status": "Отменено"}, timeout=30)
+            except Exception as err:
+                print(f"mark_status_synced after recovered manager cancel failed for {payment_id}: {err}")
             await context.bot.send_message(chat_id=query.from_user.id, text="Заявка отменена.", reply_markup=MAIN_KEYBOARD)
         else:
             await query.edit_message_text(
