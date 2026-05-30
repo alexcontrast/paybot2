@@ -1523,6 +1523,57 @@ async def apply_admin_status_result(
         pass
 
 
+
+def should_apply_existing_status_after_failed_admin_action(action: str, request: Optional[Dict[str, Any]]) -> bool:
+    """If the Telegram card is stale, reflect the real Google Sheets status instead of showing an error.
+
+    Important: when the request is still `Новая`, this is a normal path for `Оплачено`/`Отклонить`,
+    so we do NOT treat it as an error or as a stale-state shortcut.
+    For `Деньги в кассе`, `Оплачено` is the normal starting state, so if cash-in failed and the
+    sheet still says `Оплачено`, we should not pretend cash-in succeeded.
+    """
+    if not request:
+        return False
+    effective = effective_request_status(request)
+    action = str(action or "")
+
+    if effective in ["Деньги в кассе", "Отменено", "Отклонено"]:
+        return True
+
+    if action in ["paid", "reject"] and effective == "Оплачено":
+        return True
+
+    return False
+
+
+async def apply_existing_status_after_failed_admin_action(
+    context: ContextTypes.DEFAULT_TYPE,
+    query,
+    payment_id: Any,
+    request: Optional[Dict[str, Any]],
+    action: str,
+) -> bool:
+    if not should_apply_existing_status_after_failed_admin_action(action, request):
+        return False
+
+    effective = effective_request_status(request or {})
+    await apply_admin_status_result(
+        context,
+        query.message,
+        payment_id,
+        request or {},
+        processed_status=effective,
+    )
+    try:
+        if effective in ["Деньги в кассе", "Отменено", "Отклонено"]:
+            await query.answer("Карточка была устаревшей. Заявка уже закрыта, карточка убрана.")
+        else:
+            await query.answer("Карточка была устаревшей. Обновил статус по таблице.")
+    except Exception:
+        pass
+    return True
+
+
 async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Обновляю статус…")
@@ -1579,10 +1630,10 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     except asyncio.TimeoutError:
         # Проверяем один раз: иногда статус успел записаться, но ответ не вернулся.
-        request = await fetch_payment_request(payment_id, timeout=5)
-        if request and is_cashbox_archived(request):
-            await apply_admin_status_result(context, query.message, payment_id, request, processed_status=request.get("status") or status)
-            await query.answer("Заявка уже закрыта, карточка убрана.")
+        # Если карточка устарела, не показываем ошибку — приводим Telegram к факту из Google Sheets.
+        request = await fetch_payment_request(payment_id, timeout=10)
+        if await apply_existing_status_after_failed_admin_action(context, query, payment_id, request, action):
+            pass
         elif request and admin_status_reached(status, request.get("status")):
             await apply_admin_status_result(context, query.message, payment_id, request, processed_status=status)
             await query.answer("Статус записался, карточка обновлена.")
@@ -1596,11 +1647,13 @@ async def handle_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.answer("Сервер не ответил. Карточка возвращена как была.", show_alert=True)
 
     except Exception as err:
-        # Если сервер успел записать статус, покажем результат. Иначе откатываем конкретную карточку.
-        request = await fetch_payment_request(payment_id, timeout=6)
-        if request and is_cashbox_archived(request):
-            await apply_admin_status_result(context, query.message, payment_id, request, processed_status=request.get("status") or status)
-            await query.answer("Заявка уже закрыта, карточка убрана.")
+        # Если Telegram-карточка устарела, не ругаемся: сверяемся с Google Sheets и
+        # обновляем/удаляем карточки по фактическому статусу.
+        # Если в таблице всё ещё `Новая`, это штатный стартовый статус — значит действие
+        # реально не применилось, и тогда показываем исходную ошибку сервера.
+        request = await fetch_payment_request(payment_id, timeout=12)
+        if await apply_existing_status_after_failed_admin_action(context, query, payment_id, request, action):
+            pass
         elif request and admin_status_reached(status, request.get("status")):
             await apply_admin_status_result(context, query.message, payment_id, request, processed_status=status)
             await query.answer("Статус записался, карточка обновлена.")
